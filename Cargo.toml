@@ -1,8 +1,8 @@
 [package]
 name = "viewport-vulkan"
-version.workspace = true
-edition.workspace = true
-# MIT, not GPL-3.0 like the compositor crate.
+version = "0.1.3"
+edition = "2021"
+# MIT, not GPL-3.0 like the compositor this was extracted from.
 #
 # Not for upstreaming: Smithay's AI.md asks that AI-generated contributions be
 # disclosed and advises against them outright, so this will not be going into
@@ -10,40 +10,55 @@ edition.workspace = true
 #
 # MIT because the reference implementation worth reading here is wlroots'
 # Vulkan renderer, which is MIT, and because a renderer is the most reusable
-# thing in this repository — another compositor could vendor it, or someone
-# could rewrite it by hand for upstream. GPL would buy nothing in return:
-# there is no GPL Vulkan renderer to adapt from.
+# thing that came out of that repository — another compositor could vendor it,
+# or someone could rewrite it by hand for upstream. GPL would buy nothing in
+# return: there is no GPL Vulkan renderer to adapt from.
 license = "MIT"
-repository.workspace = true
+repository = "https://github.com/codebam/viewport-vulkan"
 description = "A Vulkan renderer for Smithay-based Wayland compositors"
 readme = "README.md"
 keywords = ["wayland", "vulkan", "compositor", "smithay", "renderer"]
 categories = ["graphics", "rendering", "gui"]
 
-# Publishing is blocked on the Smithay dependency, which is a git revision of a
-# fork — a crates.io package cannot depend on either. Both halves have to go:
-# `set_allow_tearing` has to land upstream, and upstream has to cut a release
-# with the dispatch2 API this is written against. The crate is otherwise
-# self-contained: it depends on no other Viewport crate and exposes no Viewport
-# type.
+# Publishing is blocked on the Smithay dependency, which is a git revision — a
+# crates.io package cannot depend on one. It needs a release carrying the
+# dispatch2 API this is written against, which 0.7.0 predates. The crate is
+# otherwise self-contained: it depends on nothing else of Viewport's and
+# exposes no Viewport type.
 publish = false
 
 [dependencies]
-anyhow.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
 ash = "0.38"
 libc = "0.2"
 
-# The fork and the revision are in the workspace manifest, shared with
-# `viewport`. Only the features are this crate's.
+# Upstream Smithay, pinned to a revision rather than the 0.7.0 release: the
+# release predates the dispatch2 rework, and the API this code is written
+# against is the one on master — `delegate_dispatch2!`, `backend.bind()`
+# returning a framebuffer, and `render_output` taking one. Bump deliberately,
+# not automatically.
+#
+# A consumer carrying a Smithay fork has to unify this with its own copy, or
+# the two crates link two Smithays into one binary — a build failure at best
+# and a silent duplicate type at worst. Cargo unifies git dependencies by (url,
+# rev), so a different URL is a different package however identical the tree.
+# The fix is a `[patch."https://github.com/Smithay/smithay"]` in the consuming
+# workspace's root manifest, which redirects this dependency too.
+#
+# wayland_frontend is not here: it is behind the `wayland` feature so the
+# renderer stays usable without a Wayland display, which is also what lets the
+# tests run headless.
 [dependencies.smithay]
-workspace = true
-# wayland_frontend is what ImportDmaWl and ImportMemWl need — they take a
-# wl_buffer. It is behind a feature so the renderer stays usable without a
-# Wayland display, which is also what lets the tests run headless.
+git = "https://github.com/Smithay/smithay.git"
+rev = "5fb12b87407b3680135c45d94214c5f1b1d0fbea"
+default-features = false
 features = ["backend_vulkan", "backend_drm", "backend_gbm"]
 
 [features]
 default = ["wayland"]
 wayland = ["smithay/wayland_frontend"]
+
+[profile.release]
+debug = 1

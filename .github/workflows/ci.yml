@@ -1,0 +1,55 @@
+# One job. This crate is a library with no display, no daemon and no
+# integration suite — fmt, clippy and the unit tests are the whole gate.
+#
+# It runs unassisted on a hosted runner because nothing here builds an engine:
+# Smithay with backend_vulkan, backend_drm and backend_gbm links libdrm,
+# libgbm and xkbcommon, all of which substitute from cache.nixos.org in
+# seconds.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A push to a branch with an open pull request fires both events, and there is
+# no reason to run the same commit twice. Keyed on head_ref rather than ref:
+# for a pull_request event github.ref is the merge ref, while the push that
+# triggered it carries refs/heads/<branch>, so keying on github.ref alone puts
+# the two in different groups and neither cancels the other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v4
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
+
+      # One `nix develop` for all three, so the shell is realised once. Split
+      # into separate steps and each would pay for it again.
+      #
+      # Ordered cheapest-first: a formatting diff is a one-line fix and there
+      # is no reason to spend a compile finding it. `set -euo pipefail`
+      # because a bare multi-line `run:` stops at the last command's status,
+      # which would let a clippy failure through whenever the tests passed.
+      #
+      # VIEWPORT_REQUIRE_GPU is deliberately *not* set. A hosted runner has no
+      # render node, so the tests that want a device skip themselves, and
+      # setting it would turn every one of those skips into a failure. The
+      # variable is for a machine that has a GPU — see the README. What is
+      # left still covers the format tables, the transform maths and the
+      # colour conversions, which is where the bugs that are not driver bugs
+      # live.
+      - name: Format, lint and test
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            cargo fmt --all --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test
+          '

@@ -34,7 +34,9 @@ a CPU mapping of the rendered buffer rather than trusting the GPU.
 - [x] `Offscreen` (with an allocator) and `Blit`
 - [x] `ImportDmaWl` / `ImportMemWl` — the `wl_buffer` wrappers
 - [x] Colour pipeline — transfer functions, primaries, reference luminance
-- [x] `wp_color_management_v1` protocol handler (in the compositor crate)
+- [x] `wp_color_management_v1` protocol handler — in the compositor, not here;
+      see [viewport-smithay](https://github.com/codebam/viewport-smithay), which
+      this was extracted from and which is its first consumer
 
 ## Why Vulkan
 
@@ -61,6 +63,35 @@ println!("{} on queue family {}", device.name(), device.queue_family());
 
 `Device::for_node` takes an existing `Instance` where one is already owned.
 
+## As a dependency
+
+Not on crates.io, and it cannot be: it depends on a git revision of Smithay
+rather than the 0.7.0 release, which predates the dispatch2 API this is written
+against. So it is a git dependency too:
+
+```toml
+[dependencies]
+viewport-vulkan = { git = "https://github.com/codebam/viewport-vulkan.git" }
+```
+
+Pin a `rev` for anything that has to build the same way twice.
+
+The Smithay pin is the part worth reading before adding it. Two crates in one
+binary cannot link two Smithays — the types would be distinct and nothing would
+convert between them — and Cargo unifies git dependencies by URL and revision,
+so a fork is a different package however identical the tree. A compositor that
+carries its own Smithay fork therefore has to redirect this crate's copy as
+well, in the root manifest of its workspace:
+
+```toml
+[patch."https://github.com/Smithay/smithay"]
+smithay = { git = "https://github.com/your/smithay.git", rev = "..." }
+```
+
+That applies to every dependency in the graph, this one included. Without it
+the build fails on a type mismatch that names `smithay` twice and looks like
+nonsense.
+
 ## Features
 
 `wayland` (default) adds `ImportDmaWl` and `ImportMemWl`, which take a
@@ -84,10 +115,16 @@ The GPU tests skip where there is no render node, and a skip is indistinguishabl
 from a pass:
 
 ```
-VIEWPORT_REQUIRE_GPU=1 cargo test -p viewport-vulkan
+VIEWPORT_REQUIRE_GPU=1 cargo test
 ```
 
-That turns every skip into a failure. CI should set it.
+That turns every skip into a failure. Set it on any machine that has a render
+node. The GitHub workflow does not, because a hosted runner has none and every
+GPU test would fail rather than skip — so what CI checks is the half that is
+arithmetic: format tables, transforms, colour conversion.
+
+`nix develop` provides the toolchain and the libraries, including the Vulkan
+loader that `ash` dlopens.
 
 ## Shaders
 
