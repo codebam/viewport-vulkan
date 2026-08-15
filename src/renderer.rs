@@ -266,6 +266,36 @@ impl VulkanRenderer {
         self.targets.retain(|(weak, _)| !weak.is_gone());
     }
 
+    /// Drop every cache entry, whether or not its buffer is still alive.
+    ///
+    /// The strong form of [`VulkanRenderer::reap`], for when the images are
+    /// wrong rather than merely unused: a device that was lost and came back,
+    /// or a multi-GPU arrangement where the import was made against a device
+    /// that is no longer the one drawing. Reaping cannot fix either, because
+    /// the client's buffer is alive and the entry keyed by it is the stale
+    /// thing.
+    ///
+    /// A dropped entry is not a lost surface. The next import recreates it —
+    /// from the same dmabuf, or by uploading the shm pool again — so this
+    /// costs the imports it discards and nothing else.
+    fn purge(&mut self) -> Result<(), Error> {
+        // Clearing these drops the last `Arc<Image>` for anything the
+        // compositor is not itself holding, and a `VkImage` destroyed while a
+        // submission still reads it is a use-after-free. `Image`'s drop has a
+        // `device_wait_idle` backstop for exactly this, but it runs per image;
+        // waiting once here is the same guarantee for one fence wait, and it
+        // also retires the semaphores that submission was holding.
+        self.commands.wait(std::time::Duration::from_secs(5))?;
+        self.imported.clear();
+        self.targets.clear();
+        // Shm textures are this renderer's own images, uploaded from the
+        // client's pool. They are as stale as the imports are, and the pool
+        // they came from is still mapped, so the next commit uploads it again.
+        #[cfg(feature = "wayland")]
+        self.shm.clear();
+        Ok(())
+    }
+
     /// Wait for a sync point, on the GPU where possible.
     ///
     /// An exportable fence becomes a semaphore the next submission waits on,
@@ -361,6 +391,10 @@ impl Renderer for VulkanRenderer {
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
         self.reap();
         Ok(())
+    }
+
+    fn invalidate_caches(&mut self) -> Result<(), Self::Error> {
+        self.purge()
     }
 }
 
@@ -1658,6 +1692,40 @@ mod tests {
             "middle of texture"
         );
         assert_eq!(pixel(&target, 8, 8), [0, 0, 0, 255], "outside it");
+    }
+
+    /// The difference between the two cache calls, which is the whole reason
+    /// `invalidate_caches` exists: a reap keeps an entry whose buffer is still
+    /// alive, and after a device loss that entry is the stale one.
+    #[test]
+    fn invalidating_the_caches_drops_what_a_reap_would_keep() {
+        let Some(mut h) = harness() else { return };
+
+        let source = buffer(&mut h.allocator, 32, 32);
+        let mut target = buffer(&mut h.allocator, 32, 32);
+        h.renderer.import_dmabuf(&source, None).expect("import");
+        drop(h.renderer.bind(&mut target).expect("bind"));
+        assert_eq!(h.renderer.imported.len(), 1, "the import was cached");
+        assert_eq!(h.renderer.targets.len(), 1, "the target was cached");
+
+        // Both buffers are still held here, so there is nothing dead to take.
+        h.renderer.cleanup_texture_cache().expect("cleanup");
+        assert_eq!(
+            h.renderer.imported.len(),
+            1,
+            "a live import survives a reap"
+        );
+        assert_eq!(h.renderer.targets.len(), 1, "a live target survives a reap");
+
+        h.renderer.invalidate_caches().expect("invalidate");
+        assert!(h.renderer.imported.is_empty(), "the import went anyway");
+        assert!(h.renderer.targets.is_empty(), "the target went anyway");
+
+        // Dropped, not lost: the buffer is still there to import again, which
+        // is what makes this safe to call on a surface a client is still
+        // showing.
+        h.renderer.import_dmabuf(&source, None).expect("re-import");
+        assert_eq!(h.renderer.imported.len(), 1, "re-imported from the dmabuf");
     }
 
     /// The second monitor's geometry: one buffer spanning every output, drawn
