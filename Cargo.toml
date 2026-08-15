@@ -52,7 +52,7 @@ libc = "0.2"
 # tests run headless.
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay.git"
-rev = "d54371145b17a8408d28ba9948af90f2887a9e36"
+rev = "347b2b30225b0425f0b44dc4c590e768f7dbe73e"
 default-features = false
 features = ["backend_vulkan", "backend_drm", "backend_gbm"]
 
