@@ -133,13 +133,21 @@ impl ImportMemWl for VulkanRenderer {
 
         let (fourcc, width, height, pixels) = imported;
         let id = buffer.id();
+        // Smithay's damage is relative to one surface's previous commit. A
+        // renderer-wide cache also contains buffers from every other surface,
+        // so only buffers belonging to this surface missed that damage.
+        let surface_id = surface.map(|surface| std::ptr::from_ref(surface).addr());
 
         // An existing texture of the same shape is updated in place. Creating
         // a new image per commit would mean an allocation and a full upload
         // every frame for every shm surface, which is the whole cost of the
         // shm path doubled.
         // Every other cached buffer has now missed this commit.
-        for entry in self.shm.iter_mut().filter(|e| e.id != id) {
+        for entry in self
+            .shm
+            .iter_mut()
+            .filter(|e| e.surface_id == surface_id && e.id != id)
+        {
             if entry.pending.len() < MAX_PENDING {
                 entry.pending.extend_from_slice(damage);
             }
@@ -150,6 +158,7 @@ impl ImportMemWl for VulkanRenderer {
             .iter_mut()
             .find(|e| {
                 e.id == id
+                    && e.surface_id == surface_id
                     && e.texture.width() as i32 == width
                     && e.texture.height() as i32 == height
                     && e.texture.image().fourcc() == fourcc
@@ -166,9 +175,11 @@ impl ImportMemWl for VulkanRenderer {
 
         // New, or a different shape: a full upload either way.
         let texture = self.import_memory(&pixels, fourcc, (width, height).into(), false)?;
-        self.shm.retain(|e| e.id != id);
+        self.shm
+            .retain(|e| e.id != id || e.surface_id != surface_id);
         self.shm.push(ShmEntry {
             id,
+            surface_id,
             texture: texture.clone(),
             pending: Vec::new(),
         });
@@ -190,6 +201,8 @@ impl VulkanRenderer {
 /// One cached shm texture.
 pub(crate) struct ShmEntry {
     pub id: smithay::reexports::wayland_server::backend::ObjectId,
+    /// Identity of the surface whose commit history `pending` describes.
+    pub surface_id: Option<usize>,
     pub texture: VulkanTexture,
     /// Damage that landed while some other buffer was the one being drawn.
     ///
