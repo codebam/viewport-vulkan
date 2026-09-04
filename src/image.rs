@@ -857,7 +857,7 @@ fn ycbcr_choice(
     // A declared matrix outranks the height rule; the rule remains the
     // fallback for every client that has not said anything, which is nearly
     // all of them.
-    let model = match representation.map(|held| held.coefficients) {
+    let model = match representation.and_then(|held| held.coefficients) {
         Some(Coefficients::Bt709) => vk::SamplerYcbcrModelConversion::YCBCR_709,
         Some(Coefficients::Bt601) => vk::SamplerYcbcrModelConversion::YCBCR_601,
         Some(Coefficients::Bt2020) => vk::SamplerYcbcrModelConversion::YCBCR_2020,
@@ -874,7 +874,7 @@ fn ycbcr_choice(
     // Limited was already the default — that is what broadcast and every
     // hardware decoder export — so declaring it changes nothing, and only a
     // full-range declaration moves.
-    let range = match representation.map(|held| held.range) {
+    let range = match representation.and_then(|held| held.range) {
         Some(Range::Full) => vk::SamplerYcbcrRange::ITU_FULL,
         _ => vk::SamplerYcbcrRange::ITU_NARROW,
     };
@@ -1348,8 +1348,8 @@ mod tests {
         range: crate::color::Range,
     ) -> crate::color::Representation {
         crate::color::Representation {
-            coefficients,
-            range,
+            coefficients: Some(coefficients),
+            range: Some(range),
             chroma: None,
         }
     }
@@ -1423,8 +1423,8 @@ mod tests {
             vertical: ChromaLocation::Midpoint,
         });
         let rep = crate::color::Representation {
-            coefficients: Coefficients::Bt709,
-            range: Range::Limited,
+            coefficients: Some(Coefficients::Bt709),
+            range: Some(Range::Limited),
             chroma: siting,
         };
         let (.., x_offset, y_offset) = ycbcr_choice(Fourcc::Nv12, 720, &mpeg_support(), Some(rep));

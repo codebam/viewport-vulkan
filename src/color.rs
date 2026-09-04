@@ -369,13 +369,25 @@ pub struct ChromaSiting {
 /// from the buffer's height and takes the range as limited — the same rule
 /// every video stack uses, and wrong exactly where nobody notices
 /// immediately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The fields are independent because the protocol's requests are: a client
+/// may declare the chroma siting of a stream while leaving the matrix to
+/// inference, and nothing in the wire format forces them to arrive as one
+/// statement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Representation {
-    pub coefficients: Coefficients,
-    pub range: Range,
+    pub coefficients: Option<Coefficients>,
+    pub range: Option<Range>,
     /// The siting the client declared, if it said. Absent keeps the
     /// device-supported default the renderer already picks.
     pub chroma: Option<ChromaSiting>,
+}
+
+/// Whether anything was actually declared.
+impl Representation {
+    pub fn is_empty(&self) -> bool {
+        self.coefficients.is_none() && self.range.is_none() && self.chroma.is_none()
+    }
 }
 
 /// The representation a surface has declared, or `None` for "guess it".
