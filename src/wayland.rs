@@ -11,7 +11,7 @@
 // Behind the `wayland` feature so the renderer stays usable — and testable —
 // without a Wayland display.
 
-use smithay::backend::renderer::{ImportDma, ImportDmaWl, ImportMem, ImportMemWl, Texture as _};
+use smithay::backend::renderer::{ImportDmaWl, ImportMem, ImportMemWl, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Buffer as BufferCoord, Rectangle};
@@ -35,11 +35,17 @@ impl ImportDmaWl for VulkanRenderer {
         &mut self,
         buffer: &WlBuffer,
         surface: Option<&SurfaceData>,
-        damage: &[Rectangle<i32, BufferCoord>],
+        _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
         let dmabuf = smithay::wayland::dmabuf::get_dmabuf(buffer)
             .map_err(|e| Error::Unsupported(format!("not a dmabuf: {e}")))?;
-        let texture = self.import_dmabuf(dmabuf, Some(damage))?;
+        // The surface's declared representation, if any, goes with the buffer:
+        // the YCbCr conversion is decided at import, and this is the only
+        // point where the buffer and the surface that committed it are both
+        // in hand. `import_dmabuf_rep` drops it again for an RGB buffer, so
+        // the lookup pays for it only where it can change the result.
+        let representation = surface.and_then(crate::color::representation_in);
+        let texture = self.import_dmabuf_rep(dmabuf, representation)?;
         Ok(described(texture, surface))
     }
 }

@@ -176,7 +176,17 @@ pub struct VulkanRenderer {
     /// A `Vec` rather than a map because `WeakDmabuf` is compared by identity
     /// and the list is short — a compositor has as many entries here as it has
     /// mapped surfaces.
-    imported: Vec<(WeakDmabuf, VulkanTexture)>,
+    ///
+    /// The middle element is the representation the import honoured. A buffer
+    /// is cached by its identity alone only among imports that agree on what
+    /// its Y′CbCr code words mean: the conversion is baked into the image the
+    /// way no RGB description is, so reusing an entry made under a different
+    /// declaration would show one client's declared matrix to another's.
+    imported: Vec<(
+        WeakDmabuf,
+        Option<crate::color::Representation>,
+        VulkanTexture,
+    )>,
 
     /// Render targets, keyed the same way. Binding the same output buffer each
     /// frame is the common case, and re-importing it would mean a
@@ -262,7 +272,7 @@ impl VulkanRenderer {
 
     /// Drop cache entries whose buffer is gone.
     fn reap(&mut self) {
-        self.imported.retain(|(weak, _)| !weak.is_gone());
+        self.imported.retain(|(weak, ..)| !weak.is_gone());
         self.targets.retain(|(weak, _)| !weak.is_gone());
     }
 
@@ -427,19 +437,38 @@ impl ImportDma for VulkanRenderer {
         dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<Self::TextureId, Self::Error> {
+        self.import_dmabuf_rep(dmabuf, None)
+    }
+}
+
+impl VulkanRenderer {
+    /// Import a client buffer, honouring what its surface declared about its
+    /// Y′CbCr code words.
+    ///
+    /// The same buffer can be imported under two declarations — one surface
+    /// saying BT.601 and another, or a later commit, saying BT.709 — and the
+    /// conversion is baked into the image, so the cache key is the pair, not
+    /// the buffer alone. Non-YUV buffers never carry one: for them every
+    /// declaration is dropped before the lookup, which keeps a compositor
+    /// whose RGB clients outnumber everything else down to one entry each.
+    pub(crate) fn import_dmabuf_rep(
+        &mut self,
+        dmabuf: &Dmabuf,
+        representation: Option<crate::color::Representation>,
+    ) -> Result<VulkanTexture, Error> {
+        use smithay::backend::allocator::Buffer as _;
+        let representation = representation.filter(|_| crate::format::is_yuv(dmabuf.format().code));
         self.reap();
-        if let Some((_, texture)) = self
-            .imported
-            .iter()
-            .find(|(weak, _)| weak.upgrade().as_ref() == Some(dmabuf))
-        {
+        if let Some((_, _, texture)) = self.imported.iter().find(|(weak, rep, _)| {
+            weak.upgrade().as_ref() == Some(dmabuf) && *rep == representation
+        }) {
             // Already imported and already acquired. The client may have
             // painted into it since, but the image and its memory are the
             // same; re-importing would allocate a second one over the same fd.
             return Ok(texture.clone());
         }
 
-        let image = Image::import(&self.device, dmabuf, Purpose::Sample)?;
+        let image = Image::import_with(&self.device, dmabuf, Purpose::Sample, representation)?;
         self.acquire_now(&image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
 
         let texture = VulkanTexture {
@@ -448,7 +477,8 @@ impl ImportDma for VulkanRenderer {
             uploadable: false,
             description: crate::color::Description::default(),
         };
-        self.imported.push((dmabuf.weak(), texture.clone()));
+        self.imported
+            .push((dmabuf.weak(), representation, texture.clone()));
         Ok(texture)
     }
 }

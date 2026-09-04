@@ -96,6 +96,21 @@ impl Image {
     /// the fd it is given on success, and the caller's `Dmabuf` still owns
     /// its own copies.
     pub fn import(device: &Device, buffer: &Dmabuf, purpose: Purpose) -> Result<Self> {
+        Self::import_with(device, buffer, purpose, None)
+    }
+
+    /// Import a DMA-BUF whose client has declared what its Y′CbCr code words
+    /// mean, per `wp-color-representation-v1`.
+    ///
+    /// `representation` only matters for a multi-planar YUV buffer; for
+    /// anything else it is dropped, because there is no conversion for it to
+    /// change.
+    pub fn import_with(
+        device: &Device,
+        buffer: &Dmabuf,
+        purpose: Purpose,
+        representation: Option<crate::color::Representation>,
+    ) -> Result<Self> {
         let fourcc = buffer.format().code;
         let modifier = u64::from(buffer.format().modifier);
         let size = buffer.size();
@@ -243,7 +258,7 @@ impl Image {
         // The conversion has to exist before the view, which names it, and it
         // is the same object the pipeline's immutable sampler will name.
         let ycbcr = if yuv {
-            match ycbcr_key(device, fourcc, vk_format, height, support) {
+            match ycbcr_key(device, fourcc, vk_format, height, support, representation) {
                 Ok(key) => Some(key),
                 Err(e) => {
                     unsafe { handle.destroy_image(image, None) };
@@ -775,50 +790,25 @@ fn bind_disjoint(
 
 /// The conversion a YUV buffer of this shape needs.
 ///
-/// Neither the matrix nor the range is carried by a DMA-BUF, so both are
-/// inferred. Height decides the matrix, which is the same rule every video
-/// stack uses: anything of standard-definition height predates BT.709 and was
-/// almost certainly encoded with BT.601, and everything taller was not. The
-/// range is taken as narrow because that is what broadcast and every hardware
-/// decoder default to; a full-range buffer read as narrow comes out slightly
-/// washed out rather than wrong.
-///
-/// The siting is not a guess: it is whichever of the two the device says it can
-/// reconstruct, preferring the one the MPEG family actually uses.
+/// If the client declared a representation over `wp-color-representation-v1`
+/// it wins; the matrix, range and siting come from what it said. Otherwise
+/// both matrix and range are inferred, since neither is carried by a DMA-BUF:
+/// height decides the matrix, which is the same rule every video stack uses
+/// (standard-definition height predates BT.709 and was almost certainly
+/// BT.601), and the range is taken as narrow because that is what broadcast
+/// and every hardware decoder default to. With no declaration the siting is
+/// whichever the device says it can reconstruct, preferring the MPEG family's.
 fn ycbcr_key(
     device: &Device,
     fourcc: smithay::backend::allocator::Fourcc,
     vk_format: vk::Format,
     height: u32,
     support: &format::ModifierSupport,
+    representation: Option<crate::color::Representation>,
 ) -> Result<crate::device::YcbcrKey> {
     use smithay::backend::allocator::Fourcc;
 
-    // 576 is PAL's active height, the tallest standard-definition format.
-    let model = if height <= 576 {
-        vk::SamplerYcbcrModelConversion::YCBCR_601
-    } else {
-        vk::SamplerYcbcrModelConversion::YCBCR_709
-    };
-
-    // Horizontally the MPEG family sites chroma on the left-hand luma sample.
-    let x_offset = if support.cosited_chroma {
-        vk::ChromaLocation::COSITED_EVEN
-    } else {
-        vk::ChromaLocation::MIDPOINT
-    };
-    // Vertically, only a 4:2:0 format has a choice to make: without vertical
-    // subsampling the chroma sample sits on the luma row by definition, and
-    // saying anything else is invalid.
-    let subsampled_vertically = matches!(
-        fourcc,
-        Fourcc::Nv12 | Fourcc::Nv21 | Fourcc::Yuv420 | Fourcc::Yvu420 | Fourcc::P010 | Fourcc::P016
-    );
-    let y_offset = if subsampled_vertically && support.midpoint_chroma {
-        vk::ChromaLocation::MIDPOINT
-    } else {
-        vk::ChromaLocation::COSITED_EVEN
-    };
+    let (model, range, x_offset, y_offset) = ycbcr_choice(fourcc, height, support, representation);
 
     // Chroma is filtered linearly only where the device says it can be. Where
     // it cannot, luma has to drop to nearest with it — Vulkan requires the two
@@ -833,7 +823,7 @@ fn ycbcr_key(
     let key = crate::device::YcbcrKey {
         format: vk_format,
         model,
-        range: vk::SamplerYcbcrRange::ITU_NARROW,
+        range,
         x_offset,
         y_offset,
         filter,
@@ -843,6 +833,93 @@ fn ycbcr_key(
     // fails the import, where the error names the buffer.
     device.ycbcr_conversion(key)?;
     Ok(key)
+}
+
+/// Which conversion a YUV buffer gets, as a pure decision.
+///
+/// Split from `ycbcr_key` so the declared-over-inferred rule can be tested
+/// without a device: only the construction of the conversion needs the
+/// GPU, not the arithmetic that says what the pixels mean.
+fn ycbcr_choice(
+    fourcc: smithay::backend::allocator::Fourcc,
+    height: u32,
+    support: &format::ModifierSupport,
+    representation: Option<crate::color::Representation>,
+) -> (
+    vk::SamplerYcbcrModelConversion,
+    vk::SamplerYcbcrRange,
+    vk::ChromaLocation,
+    vk::ChromaLocation,
+) {
+    use crate::color::{Coefficients, Range};
+    use smithay::backend::allocator::Fourcc;
+
+    // A declared matrix outranks the height rule; the rule remains the
+    // fallback for every client that has not said anything, which is nearly
+    // all of them.
+    let model = match representation.map(|held| held.coefficients) {
+        Some(Coefficients::Bt709) => vk::SamplerYcbcrModelConversion::YCBCR_709,
+        Some(Coefficients::Bt601) => vk::SamplerYcbcrModelConversion::YCBCR_601,
+        Some(Coefficients::Bt2020) => vk::SamplerYcbcrModelConversion::YCBCR_2020,
+        // 576 is PAL's active height, the tallest standard-definition format.
+        None => {
+            if height <= 576 {
+                vk::SamplerYcbcrModelConversion::YCBCR_601
+            } else {
+                vk::SamplerYcbcrModelConversion::YCBCR_709
+            }
+        }
+    };
+
+    // Limited was already the default — that is what broadcast and every
+    // hardware decoder export — so declaring it changes nothing, and only a
+    // full-range declaration moves.
+    let range = match representation.map(|held| held.range) {
+        Some(Range::Full) => vk::SamplerYcbcrRange::ITU_FULL,
+        _ => vk::SamplerYcbcrRange::ITU_NARROW,
+    };
+
+    // Horizontally the MPEG family sites chroma on the left-hand luma sample.
+    let mut x_offset = if support.cosited_chroma {
+        vk::ChromaLocation::COSITED_EVEN
+    } else {
+        vk::ChromaLocation::MIDPOINT
+    };
+    // Vertically, only a 4:2:0 format has a choice to make: without vertical
+    // subsampling the chroma sample sits on the luma row by definition, and
+    // saying anything else is invalid.
+    let subsampled_vertically = matches!(
+        fourcc,
+        Fourcc::Nv12 | Fourcc::Nv21 | Fourcc::Yuv420 | Fourcc::Yvu420 | Fourcc::P010 | Fourcc::P016
+    );
+    let mut y_offset = if subsampled_vertically && support.midpoint_chroma {
+        vk::ChromaLocation::MIDPOINT
+    } else {
+        vk::ChromaLocation::COSITED_EVEN
+    };
+
+    // A declared siting wins where the device can reconstruct it. Where it
+    // cannot, the request is honoured as far as the hardware goes rather than
+    // failing the import: a chroma sample half a pixel off is a softer edge,
+    // while a refused buffer is a black rectangle.
+    if let Some(siting) = representation.and_then(|held| held.chroma) {
+        let to_vk = |location: crate::color::ChromaLocation| match location {
+            crate::color::ChromaLocation::CositedEven => vk::ChromaLocation::COSITED_EVEN,
+            crate::color::ChromaLocation::Midpoint => vk::ChromaLocation::MIDPOINT,
+        };
+        let supported = |location: crate::color::ChromaLocation| match location {
+            crate::color::ChromaLocation::CositedEven => support.cosited_chroma,
+            crate::color::ChromaLocation::Midpoint => support.midpoint_chroma,
+        };
+        if supported(siting.horizontal) {
+            x_offset = to_vk(siting.horizontal);
+        }
+        if subsampled_vertically && supported(siting.vertical) {
+            y_offset = to_vk(siting.vertical);
+        }
+    }
+
+    (model, range, x_offset, y_offset)
 }
 
 impl std::fmt::Debug for Image {
@@ -1246,5 +1323,129 @@ mod tests {
             error.to_string().contains("does not support"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A linear 4:2:0 layout on a device that can do both sitings, which is
+    /// what the declared-versus-inferred tests need and none of what they
+    /// assert about — the point is the arithmetic, so it runs without a GPU.
+    fn mpeg_support() -> crate::format::ModifierSupport {
+        crate::format::ModifierSupport {
+            modifier: smithay::backend::allocator::Modifier::from(0u64),
+            planes: 2,
+            sampling: true,
+            rendering: false,
+            transfer_src: false,
+            transfer_dst: false,
+            cosited_chroma: true,
+            midpoint_chroma: true,
+            linear_chroma: true,
+            disjoint: false,
+        }
+    }
+
+    fn declared(
+        coefficients: crate::color::Coefficients,
+        range: crate::color::Range,
+    ) -> crate::color::Representation {
+        crate::color::Representation {
+            coefficients,
+            range,
+            chroma: None,
+        }
+    }
+
+    #[test]
+    fn a_declared_matrix_outranks_the_height_rule() {
+        use crate::color::{Coefficients, Range};
+        use smithay::backend::allocator::Fourcc;
+
+        // 1080 rows would be BT.709 on the height rule alone. A client
+        // encoding HD material with BT.601 — software scalers do it constantly —
+        // says so, and the guess has to step aside. This is the whole point of
+        // the protocol.
+        let hd = 1080;
+        let (model, ..) = ycbcr_choice(Fourcc::Nv12, hd, &mpeg_support(), None);
+        assert_eq!(model, vk::SamplerYcbcrModelConversion::YCBCR_709);
+        let (model, ..) = ycbcr_choice(
+            Fourcc::Nv12,
+            hd,
+            &mpeg_support(),
+            Some(declared(Coefficients::Bt601, Range::Limited)),
+        );
+        assert_eq!(model, vk::SamplerYcbcrModelConversion::YCBCR_601);
+
+        // And the other way: SD height, declared 709.
+        let (model, ..) = ycbcr_choice(
+            Fourcc::Nv12,
+            480,
+            &mpeg_support(),
+            Some(declared(Coefficients::Bt709, Range::Limited)),
+        );
+        assert_eq!(model, vk::SamplerYcbcrModelConversion::YCBCR_709);
+        let (model, ..) = ycbcr_choice(
+            Fourcc::Nv12,
+            2160,
+            &mpeg_support(),
+            Some(declared(Coefficients::Bt2020, Range::Limited)),
+        );
+        assert_eq!(model, vk::SamplerYcbcrModelConversion::YCBCR_2020);
+    }
+
+    #[test]
+    fn a_declared_full_range_reaches_the_sampler() {
+        use crate::color::{Coefficients, Range};
+        use smithay::backend::allocator::Fourcc;
+
+        // Full-range YUV is what every software encoder writes; read as
+        // narrow, its blacks lift and its whites clip before the shader ever
+        // runs. The guess cannot tell — a DMA-BUF says nothing — so the
+        // declaration is the only way this flips.
+        let (_, range, ..) = ycbcr_choice(Fourcc::Nv12, 720, &mpeg_support(), None);
+        assert_eq!(range, vk::SamplerYcbcrRange::ITU_NARROW);
+        let (_, range, ..) = ycbcr_choice(
+            Fourcc::Nv12,
+            720,
+            &mpeg_support(),
+            Some(declared(Coefficients::Bt709, Range::Full)),
+        );
+        assert_eq!(range, vk::SamplerYcbcrRange::ITU_FULL);
+    }
+
+    #[test]
+    fn a_declared_siting_wins_only_where_the_device_can_reconstruct_it() {
+        use crate::color::{ChromaLocation, ChromaSiting, Coefficients, Range};
+        use smithay::backend::allocator::Fourcc;
+
+        // JPEG sites chroma at the midpoint horizontally; the MPEG default is
+        // cosited. On a device that can do both, the declaration moves it.
+        let siting = Some(ChromaSiting {
+            horizontal: ChromaLocation::Midpoint,
+            vertical: ChromaLocation::Midpoint,
+        });
+        let rep = crate::color::Representation {
+            coefficients: Coefficients::Bt709,
+            range: Range::Limited,
+            chroma: siting,
+        };
+        let (.., x_offset, y_offset) = ycbcr_choice(Fourcc::Nv12, 720, &mpeg_support(), Some(rep));
+        assert_eq!(x_offset, vk::ChromaLocation::MIDPOINT);
+        assert_eq!(y_offset, vk::ChromaLocation::MIDPOINT);
+
+        // A device that cannot reconstruct midpoint chroma keeps its cosited
+        // default rather than importing a conversion it was refused;
+        // honouring a declaration beyond the hardware is the hardware's no,
+        // not the client's.
+        let mut cosited_only = mpeg_support();
+        cosited_only.midpoint_chroma = false;
+        let (.., x_offset, y_offset) = ycbcr_choice(Fourcc::Nv12, 720, &cosited_only, Some(rep));
+        assert_eq!(x_offset, vk::ChromaLocation::COSITED_EVEN);
+        assert_eq!(y_offset, vk::ChromaLocation::COSITED_EVEN);
+
+        // Vertically, a format without chroma subsampling has no choice to
+        // honour, and claiming one is invalid usage.
+        let mut both = mpeg_support();
+        both.planes = 1;
+        let (.., y_offset) = ycbcr_choice(Fourcc::Nv16, 720, &both, Some(rep));
+        assert_eq!(y_offset, vk::ChromaLocation::COSITED_EVEN);
     }
 }

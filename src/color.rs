@@ -323,6 +323,79 @@ pub fn description_in(states: &smithay::wayland::compositor::SurfaceData) -> Des
         .unwrap_or_default()
 }
 
+/// The matrix a Y′CbCr buffer was encoded with.
+///
+/// Only the three the sampler conversion can actually be told: H.273
+/// MatrixCoefficients 1, 5/6 and 9. A client declaring any other — FCC,
+/// SMPTE 240, BT.2020 constant-luminance, ICtCp — is refused by the
+/// compositor at the protocol level, so no other value reaches this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coefficients {
+    Bt709,
+    Bt601,
+    Bt2020,
+}
+
+/// Whether the code words span 0..=1 or the broadcast 16..=235 slice of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Range {
+    Full,
+    Limited,
+}
+
+/// Where downsampled chroma sits relative to the luma samples, by H.273
+/// Chroma420SampleLocType. Types 4 and 5 have no Vulkan equivalent — a
+/// chroma location is only cosited-even or midpoint — so they are refused
+/// at the protocol level rather than squashed into the nearest of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromaLocation {
+    CositedEven,
+    Midpoint,
+}
+
+/// One H.273 chroma sample location, split into the two axes Vulkan names
+/// separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromaSiting {
+    pub horizontal: ChromaLocation,
+    pub vertical: ChromaLocation,
+}
+
+/// What the client said its Y′CbCr buffers mean.
+///
+/// Set through `wp-color-representation-v1` by the compositor and stored on
+/// the surface; a DMA-BUF carries none of it, which is the whole reason the
+/// protocol exists. Without a declaration the renderer infers the matrix
+/// from the buffer's height and takes the range as limited — the same rule
+/// every video stack uses, and wrong exactly where nobody notices
+/// immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Representation {
+    pub coefficients: Coefficients,
+    pub range: Range,
+    /// The siting the client declared, if it said. Absent keeps the
+    /// device-supported default the renderer already picks.
+    pub chroma: Option<ChromaSiting>,
+}
+
+/// The representation a surface has declared, or `None` for "guess it".
+///
+/// Lives beside [`SurfaceColor`] for the same reason: the renderer reads it
+/// at import time from the surface's `SurfaceData`, and a type defined in
+/// the compositor crate could not be looked up from there.
+#[derive(Debug, Default)]
+pub struct SurfaceRepresentation(pub std::sync::Mutex<Option<Representation>>);
+
+/// What a surface's Y′CbCr buffers mean, as far as its client has said.
+pub fn representation_in(
+    states: &smithay::wayland::compositor::SurfaceData,
+) -> Option<Representation> {
+    states
+        .data_map
+        .get::<SurfaceRepresentation>()
+        .and_then(|held| held.0.lock().ok().and_then(|value| *value))
+}
+
 impl Description {
     /// Convert one encoded RGB triple into another description's encoding.
     ///
