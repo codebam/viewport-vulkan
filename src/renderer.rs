@@ -20,8 +20,8 @@ use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::{Format, Fourcc};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Renderer,
-    RendererSuper, Texture, TextureFilter,
+    Bind, Color32F, ContextId, DebugFlags, ExportMem, Frame, FrameContext, ImportDma, ImportMem,
+    Renderer, RendererSuper, Texture, TextureFilter,
 };
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
@@ -107,6 +107,17 @@ impl Texture for VulkanTexture {
 pub struct VulkanFramebuffer<'buffer> {
     image: std::sync::Arc<Image>,
     _borrow: std::marker::PhantomData<&'buffer mut Dmabuf>,
+}
+
+impl VulkanFramebuffer<'_> {
+    /// The image behind this target.
+    ///
+    /// Handed out because a background blur captures into a target and then
+    /// samples the same image back; importing it a second time would be a
+    /// second `VkImage` over the same memory, with its own layout.
+    pub fn image(&self) -> &std::sync::Arc<Image> {
+        &self.image
+    }
 }
 
 impl Texture for VulkanFramebuffer<'_> {
@@ -1293,6 +1304,274 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .cmd_set_scissor(self.command_buffer(), 0, &scissors);
         }
     }
+
+    /// Open the dynamic rendering pass for the bound target.
+    ///
+    /// Split out of `begin` because `blit_to` has to close and reopen it: a
+    /// transfer is not allowed inside a render pass, and the capture a
+    /// background blur needs happens in the middle of one.
+    fn begin_rendering(&self) {
+        let target = &self.framebuffer.image;
+        let device = self.renderer.device.clone();
+        let handle = device.handle();
+        let buffer = self.command_buffer();
+
+        let attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(target.view())
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE);
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: target.width(),
+                height: target.height(),
+            },
+        };
+        let attachments = [attachment];
+        let rendering = vk::RenderingInfo::default()
+            .render_area(area)
+            .layer_count(1)
+            .color_attachments(&attachments);
+        unsafe {
+            device
+                .dynamic_rendering()
+                .cmd_begin_rendering(buffer, &rendering);
+            handle.cmd_set_viewport(
+                buffer,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: target.width() as f32,
+                    height: target.height() as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            handle.cmd_set_scissor(buffer, 0, &[area]);
+        }
+    }
+
+    fn end_rendering(&self) {
+        let buffer = self.command_buffer();
+        unsafe {
+            self.renderer
+                .device
+                .dynamic_rendering()
+                .cmd_end_rendering(buffer);
+        }
+    }
+
+    /// Copy the current target into an offscreen buffer, downsampled.
+    ///
+    /// This is the capture half of the background blur: the effect draws after
+    /// the surfaces behind it and before the surface itself, so what it needs
+    /// is a copy of the framebuffer as it stands. `src` and `dst` are allowed
+    /// to differ in size, and do: the blur samples a quarter-resolution
+    /// texture so its cost does not grow with the output.
+    ///
+    /// The transfer is not allowed inside a render pass, so the pass is closed
+    /// and reopened around it; `LOAD` on the way back in keeps everything
+    /// drawn so far. The destination is left in `GENERAL`, which is where the
+    /// blur draw samples it from and where the next capture expects it.
+    pub fn capture_to(
+        &mut self,
+        target: &mut Dmabuf,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<std::sync::Arc<Image>, Error> {
+        let destination = self.renderer.bind(target)?;
+        let source = self.framebuffer.image.clone();
+        let to = destination.image.clone();
+        if std::sync::Arc::ptr_eq(&source, &to) {
+            return Err(Error::Unsupported(
+                "a frame cannot be captured onto itself".to_owned(),
+            ));
+        }
+        if !to.is_writable() {
+            return Err(Error::Unsupported(
+                "the capture target's modifier does not support being written".to_owned(),
+            ));
+        }
+
+        self.end_rendering();
+
+        let handle = self.renderer.device.handle();
+        let buffer = self.command_buffer();
+        let to_src = source.transition(
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::TRANSFER_READ,
+        );
+        let to_dst = to.transition(
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::TRANSFER_WRITE,
+        );
+        let restore_src = source.transition(
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        );
+        let restore_dst = to.transition(
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::empty(),
+        );
+
+        let layers = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let region = vk::ImageBlit::default()
+            .src_subresource(layers)
+            .src_offsets([
+                vk::Offset3D {
+                    x: src.loc.x,
+                    y: src.loc.y,
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: src.loc.x + src.size.w,
+                    y: src.loc.y + src.size.h,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(layers)
+            .dst_offsets([
+                vk::Offset3D {
+                    x: dst.loc.x,
+                    y: dst.loc.y,
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: dst.loc.x + dst.size.w,
+                    y: dst.loc.y + dst.size.h,
+                    z: 1,
+                },
+            ]);
+        let filter = match filter {
+            TextureFilter::Linear => vk::Filter::LINEAR,
+            TextureFilter::Nearest => vk::Filter::NEAREST,
+        };
+
+        unsafe {
+            handle.cmd_pipeline_barrier(
+                buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_src, to_dst],
+            );
+            handle.cmd_blit_image(
+                buffer,
+                source.handle(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                to.handle(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+                filter,
+            );
+            handle.cmd_pipeline_barrier(
+                buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[restore_src, restore_dst],
+            );
+        }
+
+        self.begin_rendering();
+        Ok(to)
+    }
+
+    /// Draw a captured texture back through the nine-tap blur.
+    ///
+    /// `texture` is the target [`Self::capture_to`] wrote, which is in
+    /// `GENERAL` layout and already downsampled. The shader applies `alpha`,
+    /// so a translucent surface's blur fades with it.
+    pub fn draw_background_blur(
+        &mut self,
+        texture: &Image,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        alpha: f32,
+    ) -> Result<(), Error> {
+        let scissors = self.scissors_within(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
+
+        let position = crate::transform::position(dst, self.output_size, self.transform);
+        let texcoord = crate::transform::texture(
+            src,
+            (texture.width() as f64, texture.height() as f64),
+            Transform::Normal,
+            false,
+        );
+        let push = crate::pipeline::Push::new(position, texcoord, [1.0, 1.0, 1.0, 1.0], alpha);
+
+        let target_format = self.framebuffer.image.format();
+        let pipeline = self
+            .renderer
+            .pipelines
+            .get(target_format, crate::pipeline::Kind::Blur)?;
+        let layout = self.renderer.pipelines.layout();
+        let sampler = self.renderer.pipelines.sampler();
+        let buffer = self.command_buffer();
+        let device = self.renderer.device.clone();
+        let handle = device.handle();
+
+        let image_info = vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(texture.view())
+            // The capture leaves it here; `SHADER_READ_ONLY_OPTIMAL` would be
+            // a lie the driver may or may not notice.
+            .image_layout(vk::ImageLayout::GENERAL);
+        let infos = [image_info];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&infos);
+
+        unsafe {
+            handle.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.push_descriptor().cmd_push_descriptor_set(
+                buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[write],
+            );
+            handle.cmd_push_constants(
+                buffer,
+                layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push.as_bytes(),
+            );
+            for rect in &scissors {
+                self.set_scissor(std::slice::from_ref(rect));
+                handle.cmd_draw(buffer, 4, 1, 0, 0);
+            }
+        }
+
+        self.set_scissor(&[]);
+        Ok(())
+    }
 }
 
 impl Frame for VulkanFrame<'_, '_> {
@@ -1523,6 +1802,46 @@ impl Frame for VulkanFrame<'_, '_> {
                     .wait(std::time::Duration::from_secs(5))?;
                 Ok(SyncPoint::signaled())
             }
+        }
+    }
+}
+
+/// The renderer, borrowed out of a frame.
+///
+/// Smithay's `FrameContext` hands an effect the renderer so it can allocate and
+/// bind its own targets mid-frame — which is what a background blur does. The
+/// guard keeps the frame borrowed while it is held, so an effect cannot draw
+/// into the frame it is reading.
+pub struct VulkanFrameGuard<'a, 'frame: 'a> {
+    renderer: &'a mut &'frame mut VulkanRenderer,
+}
+
+impl std::fmt::Debug for VulkanFrameGuard<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VulkanFrameGuard").finish()
+    }
+}
+
+impl AsRef<VulkanRenderer> for VulkanFrameGuard<'_, '_> {
+    fn as_ref(&self) -> &VulkanRenderer {
+        self.renderer
+    }
+}
+
+impl AsMut<VulkanRenderer> for VulkanFrameGuard<'_, '_> {
+    fn as_mut(&mut self) -> &mut VulkanRenderer {
+        self.renderer
+    }
+}
+
+impl<'a, 'frame: 'a, 'buffer> FrameContext<'a, 'frame, 'buffer, VulkanRenderer>
+    for VulkanFrame<'frame, 'buffer>
+{
+    type Guard = VulkanFrameGuard<'a, 'frame>;
+
+    fn renderer(&'a mut self) -> Self::Guard {
+        VulkanFrameGuard {
+            renderer: &mut self.renderer,
         }
     }
 }
@@ -2469,6 +2788,71 @@ mod tests {
 
         // Not destructive: the framebuffer still holds what was drawn.
         assert_eq!(pixel(&target, 4, 4), [0, 0, 255, 255]);
+    }
+
+    /// The background blur: capture the framebuffer, downsample it, then smear
+    /// a hard edge back over the target.
+    #[test]
+    fn a_background_blur_smears_a_hard_edge() {
+        let Some(mut h) = harness() else { return };
+        let mut target = buffer(&mut h.allocator, 64, 64);
+        let mut capture = buffer(&mut h.allocator, 16, 16);
+
+        let mut framebuffer = h.renderer.bind(&mut target).expect("bind");
+        let mut frame = h
+            .renderer
+            .render(&mut framebuffer, (64, 64).into(), Transform::Normal)
+            .expect("render");
+        frame
+            .clear(Color32F::from([0.0, 0.0, 0.0, 1.0]), &all(64, 64))
+            .expect("clear");
+        // A white square in the middle, on black. Large enough that the blur's
+        // nine taps all land on it in the centre, so the test can tell "still
+        // white" from "smeared at the edge".
+        frame
+            .draw_solid(
+                Rectangle::new(Point::from((16, 16)), Size::from((32, 32))),
+                &all(32, 32),
+                Color32F::from([1.0, 1.0, 1.0, 1.0]),
+            )
+            .expect("square");
+
+        let image = frame
+            .capture_to(
+                &mut capture,
+                Rectangle::from_size((64, 64).into()),
+                Rectangle::from_size((16, 16).into()),
+                TextureFilter::Linear,
+            )
+            .expect("capture");
+        frame
+            .draw_background_blur(
+                &image,
+                Rectangle::from_size((16.0, 16.0).into()),
+                Rectangle::from_size((64, 64).into()),
+                &all(64, 64),
+                1.0,
+            )
+            .expect("blur");
+        let _ = frame.finish().expect("finish");
+        drop(framebuffer);
+
+        // The blur spreads the square outward: the middle is brightest, a
+        // pixel just outside its edge picked some up, and a far corner stayed
+        // black. The exact weights are the shader's business; the gradient is
+        // what says a blur ran at all.
+        let centre = pixel(&target, 32, 32);
+        let edge = pixel(&target, 14, 32);
+        let far = pixel(&target, 2, 2);
+        assert!(
+            centre[0] > edge[0],
+            "centre {centre:?} should be brighter than edge {edge:?}"
+        );
+        assert!(
+            edge[0] > far[0],
+            "edge {edge:?} should pick up the square over far {far:?}"
+        );
+        assert!(far[0] < 30, "far corner should stay dark: {far:?}");
     }
 
     #[test]

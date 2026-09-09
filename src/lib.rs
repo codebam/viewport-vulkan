@@ -47,7 +47,10 @@ pub use device::Device;
 pub use image::{Image, Purpose};
 pub use pipeline::Pipelines;
 pub use render::{Color, Frame, Rect};
-pub use renderer::{VulkanFramebuffer, VulkanMapping, VulkanRenderer, VulkanTexture};
+pub use renderer::{
+    Error, VulkanFrame, VulkanFrameGuard, VulkanFramebuffer, VulkanMapping, VulkanRenderer,
+    VulkanTexture,
+};
 
 use anyhow::{Context as _, Result};
 use smithay::backend::drm::DrmNode;

@@ -23,6 +23,7 @@ use crate::Device;
 const QUAD_VERT: &[u8] = include_bytes!("../shaders/quad.vert.spv");
 const SOLID_FRAG: &[u8] = include_bytes!("../shaders/solid.frag.spv");
 const TEXTURE_FRAG: &[u8] = include_bytes!("../shaders/texture.frag.spv");
+const BLUR_FRAG: &[u8] = include_bytes!("../shaders/blur.frag.spv");
 
 /// The push constant block, laid out to match `shaders/common.glsl`.
 ///
@@ -123,6 +124,10 @@ impl Push {
 pub enum Kind {
     Solid,
     Texture,
+    /// The nine-tap background blur. Only drawn by
+    /// `VulkanFrame::draw_background_blur`, into the same format as the other
+    /// two.
+    Blur,
 }
 
 /// Everything a textured draw has to bind, resolved together.
@@ -161,6 +166,7 @@ pub struct Pipelines {
     vertex: vk::ShaderModule,
     solid: vk::ShaderModule,
     texture: vk::ShaderModule,
+    blur: vk::ShaderModule,
 
     sampler: vk::Sampler,
     set_layout: vk::DescriptorSetLayout,
@@ -202,6 +208,7 @@ impl Pipelines {
         let vertex = module(QUAD_VERT)?;
         let solid = module(SOLID_FRAG)?;
         let texture = module(TEXTURE_FRAG)?;
+        let blur = module(BLUR_FRAG)?;
 
         // Linear filtering because surfaces get scaled — the overview draws
         // every window shrunk. CLAMP_TO_EDGE so sampling at the very edge of a
@@ -248,6 +255,7 @@ impl Pipelines {
             vertex,
             solid,
             texture,
+            blur,
             sampler,
             set_layout,
             layout,
@@ -399,6 +407,7 @@ impl Pipelines {
         let fragment = match kind {
             Kind::Solid => self.solid,
             Kind::Texture => self.texture,
+            Kind::Blur => self.blur,
         };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -505,6 +514,7 @@ impl Drop for Pipelines {
             handle.destroy_shader_module(self.vertex, None);
             handle.destroy_shader_module(self.solid, None);
             handle.destroy_shader_module(self.texture, None);
+            handle.destroy_shader_module(self.blur, None);
         }
     }
 }
@@ -539,6 +549,7 @@ mod tests {
             ("quad.vert", QUAD_VERT),
             ("solid.frag", SOLID_FRAG),
             ("texture.frag", TEXTURE_FRAG),
+            ("blur.frag", BLUR_FRAG),
         ] {
             assert!(
                 bytes.len() % 4 == 0,
