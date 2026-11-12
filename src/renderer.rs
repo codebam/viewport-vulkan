@@ -222,6 +222,12 @@ pub struct VulkanRenderer {
     /// was baked into, sampled by the LUT variants of the pipelines. Absent is
     /// the ordinary path, untouched.
     color_lut: Option<crate::lut::ColorLut>,
+
+    /// Which cube `color_lut` holds, as the compositor named it. A profile
+    /// does not change between frames, and a compositor switches cubes only
+    /// when the output it is drawing does — so the token is what keeps the
+    /// upload to once per profile rather than once per frame per output.
+    color_lut_token: Option<u64>,
 }
 
 impl std::fmt::Debug for VulkanRenderer {
@@ -248,24 +254,32 @@ impl VulkanRenderer {
             shm: Vec::new(),
             output: crate::color::Description::default(),
             color_lut: None,
+            color_lut_token: None,
         })
     }
 
     /// Give this renderer a display colour cube, or take it away.
     ///
-    /// `data` is `size³` RGBA samples with red varying fastest. `None` goes
-    /// back to the ordinary pipelines. A cube that cannot be uploaded leaves
-    /// the renderer as it was, so a profile the driver refuses cannot take the
-    /// screen with it.
-    pub fn set_color_lut(&mut self, data: Option<&[[f32; 4]]>) -> Result<(), Error> {
-        match data {
-            Some(data) => {
+    /// The token names the cube: asking for the one already uploaded is free,
+    /// which is what makes it safe for a compositor to state the output's cube
+    /// before every frame. `data` is `size³` RGBA samples with red varying
+    /// fastest; `None` goes back to the ordinary pipelines. A cube that cannot
+    /// be uploaded leaves the renderer as it was, so a profile the driver
+    /// refuses cannot take the screen with it.
+    pub fn set_color_lut(&mut self, cube: Option<(u64, &[[f32; 4]])>) -> Result<(), Error> {
+        let token = cube.map(|(token, _)| token);
+        if self.color_lut_token == token {
+            return Ok(());
+        }
+        match cube {
+            Some((_, data)) => {
                 let side = (data.len().max(1) as f64).cbrt();
                 let size = side.round() as u32;
                 self.color_lut = Some(crate::lut::ColorLut::upload(&self.device, size, data)?);
             }
             None => self.color_lut = None,
         }
+        self.color_lut_token = token;
         Ok(())
     }
 
