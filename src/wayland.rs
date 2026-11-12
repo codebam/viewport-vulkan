@@ -46,7 +46,7 @@ impl ImportDmaWl for VulkanRenderer {
         // the lookup pays for it only where it can change the result.
         let representation = surface.and_then(crate::color::representation_in);
         let texture = self.import_dmabuf_rep(dmabuf, representation)?;
-        Ok(described(texture, surface))
+        Ok(described(texture, surface, self.sdr))
     }
 }
 
@@ -56,9 +56,15 @@ impl ImportDmaWl for VulkanRenderer {
 /// of the same pixels rather than a copy — which is also why the description
 /// has to be applied on every import instead of once: the cached image is
 /// shared with whatever else imported the same buffer.
-fn described(texture: VulkanTexture, surface: Option<&SurfaceData>) -> VulkanTexture {
+fn described(
+    texture: VulkanTexture,
+    surface: Option<&SurfaceData>,
+    sdr: crate::color::SdrEotf,
+) -> VulkanTexture {
     match surface {
-        Some(states) => texture.with_description(crate::color::description_in(states)),
+        Some(states) => {
+            texture.with_description(sdr.description(crate::color::declared_in(states)))
+        }
         // No surface: a cursor, a screencopy source, something the compositor
         // made itself. sRGB is what the texture already carries.
         None => texture,
@@ -176,7 +182,7 @@ impl ImportMemWl for VulkanRenderer {
             for region in plan_upload(damage, &pending, whole) {
                 self.update_memory(&texture, &pixels, region)?;
             }
-            return Ok(described(texture, surface));
+            return Ok(described(texture, surface, self.sdr));
         }
 
         // New, or a different shape: a full upload either way.
@@ -189,7 +195,7 @@ impl ImportMemWl for VulkanRenderer {
             texture: texture.clone(),
             pending: Vec::new(),
         });
-        Ok(described(texture, surface))
+        Ok(described(texture, surface, self.sdr))
     }
 }
 

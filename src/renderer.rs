@@ -228,6 +228,11 @@ pub struct VulkanRenderer {
     /// when the output it is drawing does — so the token is what keeps the
     /// upload to once per profile rather than once per frame per output.
     color_lut_token: Option<u64>,
+
+    /// What a surface's buffers are assumed to contain when the client
+    /// declared no image description. See [`crate::color::SdrEotf`]. Read by
+    /// the `wl_buffer` imports, which live in their own module.
+    pub(crate) sdr: crate::color::SdrEotf,
 }
 
 impl std::fmt::Debug for VulkanRenderer {
@@ -255,7 +260,17 @@ impl VulkanRenderer {
             output: crate::color::Description::default(),
             color_lut: None,
             color_lut_token: None,
+            sdr: crate::color::SdrEotf::default(),
         })
+    }
+
+    /// Say what SDR content is assumed to contain when a client declares
+    /// nothing, or declares sRGB and the compositor asked for the forced mode.
+    ///
+    /// Applies from the next import: the description rides on the texture, and
+    /// a texture imported before this call keeps the one it was given.
+    pub fn set_sdr_eotf(&mut self, eotf: crate::color::SdrEotf) {
+        self.sdr = eotf;
     }
 
     /// Give this renderer a display colour cube, or take it away.

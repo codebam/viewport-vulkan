@@ -33,7 +33,8 @@ a CPU mapping of the rendered buffer rather than trusting the GPU.
 - [x] Waiting on an imported fence in the queue rather than on the CPU
 - [x] `Offscreen` (with an allocator) and `Blit`
 - [x] `ImportDmaWl` / `ImportMemWl` — the `wl_buffer` wrappers
-- [x] Colour pipeline — transfer functions, primaries, reference luminance
+- [x] Colour pipeline — transfer functions, primaries, reference luminance,
+      and what SDR content is assumed to be when a client declares nothing
 - [x] Display colour cubes — an ICC profile's transform, sampled after the
       parametric conversion. Absent, the ordinary pipelines are untouched
 - [x] `wp_color_management_v1` protocol handler — in the compositor, not here;

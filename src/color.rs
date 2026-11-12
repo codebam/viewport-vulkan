@@ -293,6 +293,61 @@ impl Default for Description {
     }
 }
 
+/// What SDR content is assumed to be when a client declares no image
+/// description.
+///
+/// Hyprland's `render:cm_sdr_eotf`, in this renderer's terms: the compositor
+/// chooses the assumption and the renderer applies it to every surface that
+/// declared nothing — and, in the forced mode, to surfaces that declared sRGB
+/// too. That last one exists because some capture stacks and some drivers
+/// write a pure 2.2 power curve into a buffer they label sRGB, and a desk
+/// built around such a source wants to say so once rather than per window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SdrEotf {
+    /// Unspecified is sRGB, the protocol's own default.
+    #[default]
+    Srgb,
+    /// Unspecified is a pure 2.2 power curve.
+    Gamma22,
+    /// Unspecified and declared-sRGB are a pure 2.2 power curve.
+    Gamma22Force,
+}
+
+impl SdrEotf {
+    /// The description to decode a surface's buffers with, given what the
+    /// surface declared.
+    pub fn description(self, declared: Option<Description>) -> Description {
+        let gamma22 = |mut description: Description| {
+            description.transfer = TransferFunction::Gamma22;
+            description
+        };
+        match (self, declared) {
+            (Self::Srgb, _) => declared.unwrap_or_default(),
+            (Self::Gamma22, None) => gamma22(Description::default()),
+            (Self::Gamma22, declared) => declared.unwrap_or_default(),
+            (Self::Gamma22Force, None) => gamma22(Description::default()),
+            (Self::Gamma22Force, Some(description))
+                if description.transfer == TransferFunction::Srgb =>
+            {
+                gamma22(description)
+            }
+            (Self::Gamma22Force, declared) => declared.unwrap_or_default(),
+        }
+    }
+}
+
+/// The description a surface declared, or `None` for "it said nothing".
+///
+/// The difference matters for [`SdrEotf`]: a client that declared sRGB is not
+/// the same as one that declared nothing, and the forced mode treats them
+/// differently.
+pub fn declared_in(states: &smithay::wayland::compositor::SurfaceData) -> Option<Description> {
+    states
+        .data_map
+        .get::<SurfaceColor>()
+        .and_then(|color| color.0.lock().ok().and_then(|held| *held))
+}
+
 /// The description a surface has declared, or `None` for "assume sRGB".
 ///
 /// It lives here rather than beside the protocol code because the renderer is
@@ -316,11 +371,7 @@ pub fn description_for(
 
 /// The same, from a surface's state rather than the surface.
 pub fn description_in(states: &smithay::wayland::compositor::SurfaceData) -> Description {
-    states
-        .data_map
-        .get::<SurfaceColor>()
-        .and_then(|color| color.0.lock().ok().and_then(|held| *held))
-        .unwrap_or_default()
+    declared_in(states).unwrap_or_default()
 }
 
 /// The matrix a Y′CbCr buffer was encoded with.
@@ -477,6 +528,34 @@ fn invert(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_sdr_assumption_applies_to_the_buffers_it_names() {
+        let gamma22 = Description {
+            transfer: TransferFunction::Gamma22,
+            ..Description::default()
+        };
+        // The default mode leaves the protocol's answer alone.
+        assert_eq!(SdrEotf::Srgb.description(None), Description::default());
+        let declared = Description {
+            transfer: TransferFunction::Pq,
+            primaries: Primaries::BT2020,
+            ..Description::default()
+        };
+        assert_eq!(SdrEotf::Srgb.description(Some(declared)), declared);
+        // A pure power curve for surfaces that said nothing...
+        assert_eq!(SdrEotf::Gamma22.description(None), gamma22);
+        // ...but not for ones that did.
+        assert_eq!(SdrEotf::Gamma22.description(Some(declared)), declared);
+        // The forced mode takes sRGB as well, and leaves every other
+        // declaration — PQ included — alone.
+        assert_eq!(SdrEotf::Gamma22Force.description(None), gamma22);
+        assert_eq!(
+            SdrEotf::Gamma22Force.description(Some(Description::default())),
+            gamma22
+        );
+        assert_eq!(SdrEotf::Gamma22Force.description(Some(declared)), declared);
+    }
 
     #[test]
     fn sdr_white_reaches_an_hdr_screen_as_sdr_white() {
