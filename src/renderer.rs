@@ -284,7 +284,7 @@ impl VulkanRenderer {
                         // so the compositor is told once rather than per frame.
                         self.color_lut = None;
                         self.color_lut_token = token;
-                        return Err(e);
+                        return Err(Error::Other(e));
                     }
                 }
             }
