@@ -29,6 +29,7 @@ pub mod command;
 pub mod device;
 pub mod format;
 pub mod image;
+pub mod lut;
 pub mod pipeline;
 pub mod render;
 pub mod staging;
