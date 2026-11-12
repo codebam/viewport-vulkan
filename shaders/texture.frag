@@ -125,6 +125,22 @@ vec3 from_linear(vec3 v, uint transfer) {
     return mix(hi, lo, vec3(low));
 }
 
+// Tone mapping: fold the headroom a dimmer output cannot show. The reference
+// this is checked against is `TonemapMode::apply` in color.rs, and the mode
+// codes are theirs. `clamp` (2) is the plain scale, which the encode clips
+// afterwards; `on` (1) and `limited` (3) fold everything above a knee into the
+// range that is left, so the desktop's mid-tones keep their slope.
+vec3 tonemap_curve(vec3 x, uint mode) {
+    if (mode == 2u) {
+        return x;
+    }
+    float knee = mode == 3u ? 0.6 : 0.8;
+    float headroom = 1.0 - knee;
+    vec3 over = max(x - vec3(knee), vec3(0.0));
+    vec3 folded = vec3(knee) + headroom * (1.0 - exp(-over / headroom));
+    return mix(x, folded, step(vec3(knee), x));
+}
+
 void main() {
     vec4 texel = texture(surface, in_uv);
 
@@ -151,6 +167,15 @@ void main() {
     // A surface authored against a dimmer reference white has to be scaled to
     // sit correctly beside one that was not.
     linear *= push.misc.w;
+
+    // Tone mapping, when the content's peak is brighter than the output can
+    // show: `csc1.w` is the mode and `csc2.w` the ratio of target peak to
+    // source peak, both decided by the compositor. Mode zero, or a ratio at or
+    // above one, is the ordinary path — every SDR window on an SDR screen.
+    uint tonemap = uint(push.csc1.w + 0.5);
+    if (tonemap != 0u && push.csc2.w < 1.0) {
+        linear = tonemap_curve(linear * push.csc2.w, tonemap);
+    }
 
     // Out-of-gamut values are real: a saturated BT.2020 red has no sRGB
     // representation and comes out negative. Clamping is the crude answer;

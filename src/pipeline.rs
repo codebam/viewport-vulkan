@@ -98,7 +98,20 @@ impl Push {
         self.misc[3] = crate::color::luminance_scale(from, to);
         self.csc0 = [matrix[0][0], matrix[0][1], matrix[0][2], 0.0];
         self.csc1 = [matrix[1][0], matrix[1][1], matrix[1][2], 0.0];
-        self.csc2 = [matrix[2][0], matrix[2][1], matrix[2][2], 0.0];
+        // The spare `w` of csc2 is how much the source's range has to be
+        // squeezed into the target's — one when nothing has to move.
+        self.csc2 = [
+            matrix[2][0],
+            matrix[2][1],
+            matrix[2][2],
+            crate::color::tonemap_ratio(from, to),
+        ];
+        self
+    }
+
+    /// Apply one of the `tonemap` rule modes, in the spare `w` of csc1.
+    pub fn with_tonemap(mut self, mode: crate::color::TonemapMode) -> Self {
+        self.csc1[3] = mode.as_code() as f32;
         self
     }
 

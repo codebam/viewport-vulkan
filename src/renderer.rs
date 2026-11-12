@@ -62,6 +62,10 @@ pub struct VulkanTexture {
     /// What the pixels in this buffer mean. Defaults to SDR sRGB, which is
     /// what a client that says nothing is assumed to have sent.
     description: crate::color::Description,
+    /// How this surface's content is tone mapped when its peak luminance is
+    /// above what the output can show. A window rule says; `on` is what a
+    /// surface that said nothing gets, as in Hyprland.
+    tonemap: crate::color::TonemapMode,
 }
 
 impl VulkanTexture {
@@ -84,6 +88,13 @@ impl VulkanTexture {
     /// what a client changing its image description mid-stream produces.
     pub fn with_description(mut self, description: crate::color::Description) -> Self {
         self.description = description;
+        self
+    }
+
+    /// Say how this buffer's content is tone mapped. Taken by value for the
+    /// same reason the description is.
+    pub fn with_tonemap(mut self, tonemap: crate::color::TonemapMode) -> Self {
+        self.tonemap = tonemap;
         self
     }
 }
@@ -551,6 +562,7 @@ impl VulkanRenderer {
             flipped: false,
             uploadable: false,
             description: crate::color::Description::default(),
+            tonemap: crate::color::TonemapMode::default(),
         };
         self.imported
             .push((dmabuf.weak(), representation, texture.clone()));
@@ -577,6 +589,7 @@ impl ImportMem for VulkanRenderer {
             flipped,
             uploadable: true,
             description: crate::color::Description::default(),
+            tonemap: crate::color::TonemapMode::default(),
         };
 
         let whole = Rectangle::from_size(size);
@@ -1831,6 +1844,7 @@ impl Frame for VulkanFrame<'_, '_> {
         // White tint: the texture's own colours, scaled by alpha.
         let push = crate::pipeline::Push::new(position, texcoord, [1.0, 1.0, 1.0, 1.0], alpha)
             .with_color(&texture.description, &self.renderer.output)
+            .with_tonemap(texture.tonemap)
             .with_opaque(!texture.image.has_alpha());
 
         let target_format = self.framebuffer.image.format();

@@ -268,6 +268,92 @@ pub fn luminance_scale(from: &Description, to: &Description) -> f32 {
     }
 }
 
+/// One of Hyprland's `tonemap` window-rule modes, in this renderer's terms.
+///
+/// Tone mapping is what happens when the content's peak luminance is brighter
+/// than the output can show: the top of the range is folded down into what is
+/// left rather than clipped off. The reference implementation is
+/// [`TonemapMode::apply`], which the fragment shader's `tonemap_curve` is
+/// checked against the way every other colour function here is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TonemapMode {
+    /// Leave the range to clip. Hyprland's `off`.
+    Off,
+    /// Fold highlights above a knee into the headroom that is left, so
+    /// mid-tones do not move. The default, and Hyprland's `on`.
+    #[default]
+    On,
+    /// Scale the source peak onto the target's and clip whatever is left.
+    /// Hyprland's `clamp`.
+    Clamp,
+    /// The same fold with an earlier knee, so more of the picture moves and
+    /// the highlights keep their detail on a dimmer panel. Hyprland's
+    /// `limited`.
+    Limited,
+}
+
+impl TonemapMode {
+    /// Must match the mode constants in `shaders/texture.frag`.
+    pub fn as_code(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Clamp => 2,
+            Self::Limited => 3,
+        }
+    }
+
+    /// The knee: below this, in target units, a value is left alone.
+    fn knee(self) -> f32 {
+        match self {
+            Self::Limited => 0.6,
+            _ => 0.8,
+        }
+    }
+
+    /// What one colour becomes once the source range has been squeezed into
+    /// the target's. `ratio` is [`tonemap_ratio`], and `rgb` is light in the
+    /// target's units — so a source peak of 1.0 against a ratio of 0.2 arrives
+    /// here as 0.2.
+    pub fn apply(self, ratio: f32, rgb: [f32; 3]) -> [f32; 3] {
+        if self == Self::Off || ratio >= 1.0 {
+            return rgb;
+        }
+        let scaled = rgb.map(|value| value * ratio);
+        if self == Self::Clamp {
+            return scaled;
+        }
+        let knee = self.knee();
+        scaled.map(|value| {
+            if value <= knee {
+                value
+            } else {
+                let headroom = 1.0 - knee;
+                knee + headroom * (1.0 - (-(value - knee) / headroom).exp())
+            }
+        })
+    }
+}
+
+/// How much a source's range has to be squeezed to fit a target's.
+///
+/// One when nothing has to move — the target can carry everything the source
+/// has — and below one exactly when the source is brighter than the output.
+/// The comparison is between encodable peaks: PQ can carry 10,000 cd/m², and
+/// every relative curve carries its reference white.
+pub fn tonemap_ratio(from: &Description, to: &Description) -> f32 {
+    encodable_peak(to) / encodable_peak(from)
+}
+
+/// The brightest light a description's encoding can carry, in cd/m².
+pub fn encodable_peak(description: &Description) -> f32 {
+    if description.transfer.is_absolute() {
+        PQ_PEAK_LUMINANCE
+    } else {
+        description.reference_luminance
+    }
+}
+
 pub const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 /// Everything the renderer needs to know about one image's colour.
@@ -334,6 +420,24 @@ impl SdrEotf {
             (Self::Gamma22Force, declared) => declared.unwrap_or_default(),
         }
     }
+}
+
+/// How a surface's content is tone mapped, as a window rule said.
+///
+/// Set by the compositor when it resolves the window's rules and read by the
+/// renderer at import, for the same reason [`SurfaceColor`] lives here: the
+/// `wl_buffer` wrapper is handed a surface's `SurfaceData` and nothing else,
+/// so a type defined in the compositor crate could not be looked up at the
+/// point where the texture is made.
+#[derive(Debug, Default)]
+pub struct SurfaceTonemap(pub std::sync::Mutex<Option<TonemapMode>>);
+
+/// The tone-mapping rule a surface carries, if it carries one.
+pub fn tonemap_in(states: &smithay::wayland::compositor::SurfaceData) -> Option<TonemapMode> {
+    states
+        .data_map
+        .get::<SurfaceTonemap>()
+        .and_then(|held| held.0.lock().ok().and_then(|value| *value))
 }
 
 /// The description a surface declared, or `None` for "it said nothing".
@@ -528,6 +632,59 @@ fn invert(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tone_mapping_is_the_identity_when_nothing_has_to_move() {
+        let value = [0.4, 0.9, 2.0];
+        // No compression needed: every mode leaves the picture alone.
+        for mode in [
+            TonemapMode::Off,
+            TonemapMode::On,
+            TonemapMode::Clamp,
+            TonemapMode::Limited,
+        ] {
+            assert_eq!(mode.apply(1.0, value), value);
+            assert_eq!(mode.apply(2.0, value), value);
+        }
+    }
+
+    #[test]
+    fn tone_mapping_keeps_the_mid_tones_and_folds_the_highlights() {
+        // HDR content on an SDR screen: 203 cd/m² of headroom against a
+        // source that can carry 10,000.
+        let ratio = 0.0203;
+        // Everything under the knee is untouched: a mid-tone keeps its slope.
+        let mid = TonemapMode::On.apply(ratio, [0.5 / ratio; 3])[0];
+        assert!((mid - 0.5).abs() < 1e-4, "{mid}");
+        // A value that lands just over one in target units is folded back into
+        // the range rather than clipped away.
+        let highlight = TonemapMode::On.apply(ratio, [1.2 / ratio; 3])[0];
+        assert!(highlight > 0.8, "{highlight}");
+        assert!(highlight < 1.0, "{highlight}");
+        // Clamp is the plain scale, which the encode then clips.
+        let clamped = TonemapMode::Clamp.apply(ratio, [1.2 / ratio; 3])[0];
+        assert!((clamped - 1.2).abs() < 1e-4, "{clamped}");
+        // Limited starts folding lower: a value between the two knees moves
+        // where On leaves it alone, and the same highlight folds further.
+        let between = 0.7 / ratio;
+        assert!((TonemapMode::On.apply(ratio, [between; 3])[0] - 0.7).abs() < 1e-4);
+        assert!(TonemapMode::Limited.apply(ratio, [between; 3])[0] < 0.7);
+        assert!(TonemapMode::Limited.apply(ratio, [1.2 / ratio; 3])[0] < highlight);
+    }
+
+    #[test]
+    fn the_ratio_is_one_unless_the_output_is_the_dimmer_one() {
+        let sdr = Description::default();
+        let hdr = Description {
+            transfer: TransferFunction::Pq,
+            primaries: Primaries::BT2020,
+            ..Description::default()
+        };
+        assert!((tonemap_ratio(&sdr, &sdr) - 1.0).abs() < 1e-5);
+        assert!(tonemap_ratio(&sdr, &hdr) > 1.0);
+        assert!(tonemap_ratio(&hdr, &sdr) < 1.0);
+        assert!((tonemap_ratio(&hdr, &sdr) - 0.0203).abs() < 1e-4);
+    }
 
     #[test]
     fn an_sdr_assumption_applies_to_the_buffers_it_names() {

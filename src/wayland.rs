@@ -62,11 +62,13 @@ fn described(
     sdr: crate::color::SdrEotf,
 ) -> VulkanTexture {
     match surface {
-        Some(states) => {
-            texture.with_description(sdr.description(crate::color::declared_in(states)))
-        }
+        Some(states) => texture
+            .with_description(sdr.description(crate::color::declared_in(states)))
+            .with_tonemap(crate::color::tonemap_in(states).unwrap_or_default()),
         // No surface: a cursor, a screencopy source, something the compositor
-        // made itself. sRGB is what the texture already carries.
+        // made itself. sRGB is what the texture already carries, and tone
+        // mapping there is the identity until an output is dimmer than the
+        // source.
         None => texture,
     }
 }
