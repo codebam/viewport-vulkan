@@ -275,7 +275,18 @@ impl VulkanRenderer {
             Some((_, data)) => {
                 let side = (data.len().max(1) as f64).cbrt();
                 let size = side.round() as u32;
-                self.color_lut = Some(crate::lut::ColorLut::upload(&self.device, size, data)?);
+                match crate::lut::ColorLut::upload(&self.device, size, data) {
+                    Ok(lut) => self.color_lut = Some(lut),
+                    Err(e) => {
+                        // The previous cube may belong to another output, so it
+                        // goes too: the parametric path is wrong for this panel
+                        // but not wrong for every other one. The token is kept
+                        // so the compositor is told once rather than per frame.
+                        self.color_lut = None;
+                        self.color_lut_token = token;
+                        return Err(e);
+                    }
+                }
             }
             None => self.color_lut = None,
         }
