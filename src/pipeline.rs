@@ -24,6 +24,13 @@ const QUAD_VERT: &[u8] = include_bytes!("../shaders/quad.vert.spv");
 const SOLID_FRAG: &[u8] = include_bytes!("../shaders/solid.frag.spv");
 const TEXTURE_FRAG: &[u8] = include_bytes!("../shaders/texture.frag.spv");
 const BLUR_FRAG: &[u8] = include_bytes!("../shaders/blur.frag.spv");
+// The same three shaders built with `-DCOLOR_LUT`, which declares a 3D cube
+// and samples it at the end. A separate module rather than a push-constant
+// branch: a display with no profile keeps exactly the pipeline it had, and a
+// broken cube cannot reach a draw that did not ask for one.
+const TEXTURE_LUT_FRAG: &[u8] = include_bytes!("../shaders/texture.lut.frag.spv");
+const SOLID_LUT_FRAG: &[u8] = include_bytes!("../shaders/solid.lut.frag.spv");
+const BLUR_LUT_FRAG: &[u8] = include_bytes!("../shaders/blur.lut.frag.spv");
 
 /// The push constant block, laid out to match `shaders/common.glsl`.
 ///
@@ -168,9 +175,22 @@ pub struct Pipelines {
     texture: vk::ShaderModule,
     blur: vk::ShaderModule,
 
+    solid_lut: vk::ShaderModule,
+    texture_lut: vk::ShaderModule,
+    blur_lut: vk::ShaderModule,
+
     sampler: vk::Sampler,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
+
+    /// The sampler the colour cube is sampled through, and the set layout and
+    /// pipeline layout the LUT variants of the pipelines are built against.
+    /// Separate from the ordinary ones because those carry only the surface
+    /// binding, and a pipeline built against a layout with one binding cannot
+    /// be drawn with a cube.
+    lut_sampler: vk::Sampler,
+    lut_set_layout: vk::DescriptorSetLayout,
+    lut_layout: vk::PipelineLayout,
 
     /// Pipelines are tied to the format they render into, and a compositor
     /// renders into whatever its outputs and clients happen to use. Built on
@@ -179,6 +199,9 @@ pub struct Pipelines {
     /// The third part of the key is which YCbCr conversion the source is
     /// sampled through, because that changes the pipeline layout.
     by_format: HashMap<(vk::Format, Kind, Option<crate::device::YcbcrKey>), vk::Pipeline>,
+
+    /// The cube variants, by the format they render into and the kind of draw.
+    lut_by_format: HashMap<(vk::Format, Kind), vk::Pipeline>,
 
     /// One entry per conversion in use. Built the first time a video frame in
     /// that format is drawn.
@@ -209,6 +232,9 @@ impl Pipelines {
         let solid = module(SOLID_FRAG)?;
         let texture = module(TEXTURE_FRAG)?;
         let blur = module(BLUR_FRAG)?;
+        let solid_lut = module(SOLID_LUT_FRAG)?;
+        let texture_lut = module(TEXTURE_LUT_FRAG)?;
+        let blur_lut = module(BLUR_LUT_FRAG)?;
 
         // Linear filtering because surfaces get scaled — the overview draws
         // every window shrunk. CLAMP_TO_EDGE so sampling at the very edge of a
@@ -238,6 +264,41 @@ impl Pipelines {
         let set_layout = unsafe { handle.create_descriptor_set_layout(&set_layout_info, None) }
             .context("vkCreateDescriptorSetLayout")?;
 
+        // The cube's sampler: linear, because a cube is a lookup table and the
+        // interpolation between its samples is the point of it; clamped, so a
+        // coordinate at a face samples that face rather than wrapping.
+        let lut_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let lut_sampler = unsafe { handle.create_sampler(&lut_sampler_info, None) }
+            .context("vkCreateSampler for the colour cube")?;
+
+        // Two bindings: the surface as before, and the cube. The cube is
+        // pushed like the surface is, so a renderer can swap one output's cube
+        // for another's without recreating anything.
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let lut_set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+            .bindings(&bindings);
+        let lut_set_layout =
+            unsafe { handle.create_descriptor_set_layout(&lut_set_layout_info, None) }
+                .context("vkCreateDescriptorSetLayout for the colour cube")?;
+
         let push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -249,6 +310,12 @@ impl Pipelines {
             .push_constant_ranges(&ranges);
         let layout = unsafe { handle.create_pipeline_layout(&layout_info, None) }
             .context("vkCreatePipelineLayout")?;
+        let lut_set_layouts = [lut_set_layout];
+        let lut_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&lut_set_layouts)
+            .push_constant_ranges(&ranges);
+        let lut_layout = unsafe { handle.create_pipeline_layout(&lut_layout_info, None) }
+            .context("vkCreatePipelineLayout for the colour cube")?;
 
         Ok(Self {
             device: device.clone(),
@@ -256,10 +323,17 @@ impl Pipelines {
             solid,
             texture,
             blur,
+            solid_lut,
+            texture_lut,
+            blur_lut,
             sampler,
             set_layout,
             layout,
+            lut_sampler,
+            lut_set_layout,
+            lut_layout,
             by_format: HashMap::new(),
+            lut_by_format: HashMap::new(),
             ycbcr: HashMap::new(),
         })
     }
@@ -270,6 +344,24 @@ impl Pipelines {
 
     pub fn sampler(&self) -> vk::Sampler {
         self.sampler
+    }
+
+    pub fn lut_sampler(&self) -> vk::Sampler {
+        self.lut_sampler
+    }
+
+    pub fn lut_layout(&self) -> vk::PipelineLayout {
+        self.lut_layout
+    }
+
+    /// The cube variant of one kind of draw into this format, built on demand.
+    pub fn lut(&mut self, format: vk::Format, kind: Kind) -> Result<vk::Pipeline> {
+        if let Some(pipeline) = self.lut_by_format.get(&(format, kind)) {
+            return Ok(*pipeline);
+        }
+        let pipeline = self.build(format, kind, self.lut_layout, true)?;
+        self.lut_by_format.insert((format, kind), pipeline);
+        Ok(pipeline)
     }
 
     /// The pipeline for this kind of draw into this format, building it if it
@@ -390,7 +482,7 @@ impl Pipelines {
         if let Some(pipeline) = self.by_format.get(&(format, kind, key)) {
             return Ok(*pipeline);
         }
-        let pipeline = self.build(format, kind, layout)?;
+        let pipeline = self.build(format, kind, layout, false)?;
         self.by_format.insert((format, kind, key), pipeline);
         Ok(pipeline)
     }
@@ -400,14 +492,18 @@ impl Pipelines {
         format: vk::Format,
         kind: Kind,
         layout: vk::PipelineLayout,
+        lut: bool,
     ) -> Result<vk::Pipeline> {
         let handle = self.device.handle();
         let entry = c"main";
 
-        let fragment = match kind {
-            Kind::Solid => self.solid,
-            Kind::Texture => self.texture,
-            Kind::Blur => self.blur,
+        let fragment = match (kind, lut) {
+            (Kind::Solid, false) => self.solid,
+            (Kind::Texture, false) => self.texture,
+            (Kind::Blur, false) => self.blur,
+            (Kind::Solid, true) => self.solid_lut,
+            (Kind::Texture, true) => self.texture_lut,
+            (Kind::Blur, true) => self.blur_lut,
         };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -499,6 +595,9 @@ impl Drop for Pipelines {
             for pipeline in self.by_format.values() {
                 handle.destroy_pipeline(*pipeline, None);
             }
+            for pipeline in self.lut_by_format.values() {
+                handle.destroy_pipeline(*pipeline, None);
+            }
             // Before the ordinary layout, and in this order within each: a
             // layout may not outlive the pipelines built against it, and a
             // sampler may not outlive the set layout that holds it immutably.
@@ -508,6 +607,9 @@ impl Drop for Pipelines {
                 handle.destroy_descriptor_set_layout(ycbcr.set_layout, None);
                 handle.destroy_sampler(ycbcr.sampler, None);
             }
+            handle.destroy_pipeline_layout(self.lut_layout, None);
+            handle.destroy_descriptor_set_layout(self.lut_set_layout, None);
+            handle.destroy_sampler(self.lut_sampler, None);
             handle.destroy_pipeline_layout(self.layout, None);
             handle.destroy_descriptor_set_layout(self.set_layout, None);
             handle.destroy_sampler(self.sampler, None);
@@ -515,6 +617,9 @@ impl Drop for Pipelines {
             handle.destroy_shader_module(self.solid, None);
             handle.destroy_shader_module(self.texture, None);
             handle.destroy_shader_module(self.blur, None);
+            handle.destroy_shader_module(self.solid_lut, None);
+            handle.destroy_shader_module(self.texture_lut, None);
+            handle.destroy_shader_module(self.blur_lut, None);
         }
     }
 }

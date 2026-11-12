@@ -34,6 +34,8 @@ a CPU mapping of the rendered buffer rather than trusting the GPU.
 - [x] `Offscreen` (with an allocator) and `Blit`
 - [x] `ImportDmaWl` / `ImportMemWl` — the `wl_buffer` wrappers
 - [x] Colour pipeline — transfer functions, primaries, reference luminance
+- [x] Display colour cubes — an ICC profile's transform, sampled after the
+      parametric conversion. Absent, the ordinary pipelines are untouched
 - [x] `wp_color_management_v1` protocol handler — in the compositor, not here;
       see [viewport-smithay](https://github.com/codebam/viewport-smithay), which
       this was extracted from and which is its first consumer
@@ -47,6 +49,17 @@ driver-specific guesswork about what an imported texture actually contains.
 Under Vulkan the format, modifier and colour space of an imported image are
 stated explicitly, which is the difference between implementing
 `color-management-v1` and approximating it.
+
+An ICC display profile is the other half of the same problem, and not one the
+parametric path can express: a profile says, as a table, what every device
+value means, and the transform it implies is not a transfer function plus a
+matrix. So the compositor bakes the profile into a cube, [`lut`](src/lut.rs)
+uploads it, and a variant of each fragment shader samples it after the
+parametric conversion — a display with a profile is corrected for the panel it
+is actually on. The variants are separate pipelines, built on demand: a display
+without a profile keeps exactly the pipeline it had, and a cube that cannot be
+uploaded cannot break it. A YCbCr conversion bakes its matrix and range into
+the sampler and has no cube variant yet, so video keeps the parametric path.
 
 ## Using it
 

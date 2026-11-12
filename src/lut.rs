@@ -167,8 +167,7 @@ impl ColorLut {
             .device
             .memory_type_with(requirements.memory_type_bits, |flags| {
                 flags.contains(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE
-                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
             })
             .ok_or_else(|| anyhow!("no host-visible memory type"))?;
@@ -181,8 +180,10 @@ impl ColorLut {
         let result = (|| -> Result<()> {
             unsafe { handle.bind_buffer_memory(staging, staging_memory, 0) }
                 .context("vkBindBufferMemory")?;
-            let pointer = unsafe { handle.map_memory(staging_memory, 0, bytes as u64, vk::MemoryMapFlags::empty()) }
-                .context("vkMapMemory")?;
+            let pointer = unsafe {
+                handle.map_memory(staging_memory, 0, bytes as u64, vk::MemoryMapFlags::empty())
+            }
+            .context("vkMapMemory")?;
             let mut half = Vec::with_capacity(bytes);
             for sample in data {
                 for channel in sample {
@@ -311,8 +312,9 @@ impl ColorLut {
                 .end_command_buffer(buffer)
                 .expect("end a one-shot command buffer");
 
-            let fence =
-                handle.create_fence(&vk::FenceCreateInfo::default(), None).expect("a fence");
+            let fence = handle
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .expect("a fence");
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&buffer));
             handle
                 .queue_submit(self.device.queue(), &[submit], fence)

@@ -217,6 +217,11 @@ pub struct VulkanRenderer {
 
     /// What the output expects. Every textured draw converts into this.
     output: crate::color::Description,
+
+    /// The output's colour transform, when it has one: the cube an ICC profile
+    /// was baked into, sampled by the LUT variants of the pipelines. Absent is
+    /// the ordinary path, untouched.
+    color_lut: Option<crate::lut::ColorLut>,
 }
 
 impl std::fmt::Debug for VulkanRenderer {
@@ -242,7 +247,26 @@ impl VulkanRenderer {
             #[cfg(feature = "wayland")]
             shm: Vec::new(),
             output: crate::color::Description::default(),
+            color_lut: None,
         })
+    }
+
+    /// Give this renderer a display colour cube, or take it away.
+    ///
+    /// `data` is `size³` RGBA samples with red varying fastest. `None` goes
+    /// back to the ordinary pipelines. A cube that cannot be uploaded leaves
+    /// the renderer as it was, so a profile the driver refuses cannot take the
+    /// screen with it.
+    pub fn set_color_lut(&mut self, data: Option<&[[f32; 4]]>) -> Result<(), Error> {
+        match data {
+            Some(data) => {
+                let side = (data.len().max(1) as f64).cbrt();
+                let size = side.round() as u32;
+                self.color_lut = Some(crate::lut::ColorLut::upload(&self.device, size, data)?);
+            }
+            None => self.color_lut = None,
+        }
+        Ok(())
     }
 
     /// A renderer that can also allocate its own render targets.
@@ -1525,37 +1549,39 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let push = crate::pipeline::Push::new(position, texcoord, [1.0, 1.0, 1.0, 1.0], alpha);
 
         let target_format = self.framebuffer.image.format();
-        let pipeline = self
-            .renderer
-            .pipelines
-            .get(target_format, crate::pipeline::Kind::Blur)?;
-        let layout = self.renderer.pipelines.layout();
+        // The capture behind a translucent surface is unmodified source
+        // colour; this draw is where it reaches the screen, so this is where
+        // the output's cube applies.
+        let lut = self.renderer.color_lut.as_ref().map(|lut| lut.view());
+        let (pipeline, layout) = match lut {
+            Some(_) => (
+                self.renderer
+                    .pipelines
+                    .lut(target_format, crate::pipeline::Kind::Blur)?,
+                self.renderer.pipelines.lut_layout(),
+            ),
+            None => (
+                self.renderer
+                    .pipelines
+                    .get(target_format, crate::pipeline::Kind::Blur)?,
+                self.renderer.pipelines.layout(),
+            ),
+        };
         let sampler = self.renderer.pipelines.sampler();
         let buffer = self.command_buffer();
         let device = self.renderer.device.clone();
         let handle = device.handle();
 
-        let image_info = vk::DescriptorImageInfo::default()
+        let surface_info = vk::DescriptorImageInfo::default()
             .sampler(sampler)
             .image_view(texture.view())
             // The capture leaves it here; `SHADER_READ_ONLY_OPTIMAL` would be
             // a lie the driver may or may not notice.
             .image_layout(vk::ImageLayout::GENERAL);
-        let infos = [image_info];
-        let write = vk::WriteDescriptorSet::default()
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&infos);
-
+        let lut_info = lut.map(|view| self.colour_cube(view));
+        self.push_descriptors(buffer, layout, Some(surface_info), lut_info);
         unsafe {
             handle.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.push_descriptor().cmd_push_descriptor_set(
-                buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                layout,
-                0,
-                &[write],
-            );
             handle.cmd_push_constants(
                 buffer,
                 layout,
@@ -1571,6 +1597,67 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
         self.set_scissor(&[]);
         Ok(())
+    }
+}
+
+impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
+    /// Push the descriptors one draw needs.
+    ///
+    /// The surface, when the draw samples one, at binding 0; the output's
+    /// colour cube at binding 1, when the renderer has one. A binding the
+    /// shader does not statically use may be left undefined, which is what a
+    /// solid draw does with the surface binding.
+    fn push_descriptors(
+        &self,
+        buffer: vk::CommandBuffer,
+        layout: vk::PipelineLayout,
+        surface: Option<vk::DescriptorImageInfo>,
+        lut: Option<vk::DescriptorImageInfo>,
+    ) {
+        let mut infos = Vec::with_capacity(2);
+        let mut bindings = Vec::with_capacity(2);
+        if let Some(info) = surface {
+            infos.push(info);
+            bindings.push(0u32);
+        }
+        if let Some(info) = lut {
+            infos.push(info);
+            bindings.push(1u32);
+        }
+        if infos.is_empty() {
+            return;
+        }
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .zip(bindings.iter())
+            .map(|(info, binding)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_binding(*binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe {
+            self.renderer
+                .device
+                .push_descriptor()
+                .cmd_push_descriptor_set(
+                    buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &writes,
+                );
+        }
+    }
+
+    /// What binding 1 needs for a cube: the renderer's sampler and the image
+    /// view the upload left in shader-read layout.
+    fn colour_cube(&self, view: vk::ImageView) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default()
+            .sampler(self.renderer.pipelines.lut_sampler())
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
     }
 }
 
@@ -1623,10 +1710,23 @@ impl Frame for VulkanFrame<'_, '_> {
         }
 
         let target_format = self.framebuffer.image.format();
-        let pipeline = self
-            .renderer
-            .pipelines
-            .get(target_format, crate::pipeline::Kind::Solid)?;
+        // A cube, when the output has one, is drawn through its own pipeline:
+        // the ordinary one has no binding for it and must stay untouched.
+        let lut = self.renderer.color_lut.as_ref().map(|lut| lut.view());
+        let (pipeline, layout) = match lut {
+            Some(_) => (
+                self.renderer
+                    .pipelines
+                    .lut(target_format, crate::pipeline::Kind::Solid)?,
+                self.renderer.pipelines.lut_layout(),
+            ),
+            None => (
+                self.renderer
+                    .pipelines
+                    .get(target_format, crate::pipeline::Kind::Solid)?,
+                self.renderer.pipelines.layout(),
+            ),
+        };
         let position = crate::transform::position(dst, self.output_size, self.transform);
         let push = crate::pipeline::Push::new(
             position,
@@ -1641,8 +1741,9 @@ impl Frame for VulkanFrame<'_, '_> {
         );
 
         let buffer = self.command_buffer();
-        let layout = self.renderer.pipelines.layout();
         let handle = self.renderer.device.handle();
+        let lut_info = lut.map(|view| self.colour_cube(view));
+        self.push_descriptors(buffer, layout, None, lut_info);
         unsafe {
             handle.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             handle.cmd_push_constants(
@@ -1693,37 +1794,47 @@ impl Frame for VulkanFrame<'_, '_> {
             .with_opaque(!texture.image.has_alpha());
 
         let target_format = self.framebuffer.image.format();
+        // A YCbCr conversion bakes the matrix and range into the sampler, and
+        // there is no cube variant of that chain — so video keeps the
+        // parametric path and ignores the output's profile. That gap is in the
+        // README rather than approximated here.
+        let lut = self
+            .renderer
+            .color_lut
+            .as_ref()
+            .map(|lut| lut.view())
+            .filter(|_| texture.image.ycbcr().is_none());
         // Pipeline, layout and sampler together: a YUV texture is sampled
         // through a conversion, which makes its sampler immutable in the set
         // layout and so ties all three to each other.
-        let bound = self
-            .renderer
-            .pipelines
-            .texture(target_format, &texture.image)?;
-        let layout = bound.layout;
+        let (pipeline, layout, sampler) = match lut {
+            Some(_) => (
+                self.renderer
+                    .pipelines
+                    .lut(target_format, crate::pipeline::Kind::Texture)?,
+                self.renderer.pipelines.lut_layout(),
+                self.renderer.pipelines.sampler(),
+            ),
+            None => {
+                let bound = self
+                    .renderer
+                    .pipelines
+                    .texture(target_format, &texture.image)?;
+                (bound.pipeline, bound.layout, bound.sampler)
+            }
+        };
         let buffer = self.command_buffer();
         let device = self.renderer.device.clone();
         let handle = device.handle();
 
-        let image_info = vk::DescriptorImageInfo::default()
-            .sampler(bound.sampler)
+        let surface_info = vk::DescriptorImageInfo::default()
+            .sampler(sampler)
             .image_view(texture.image.view())
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let infos = [image_info];
-        let write = vk::WriteDescriptorSet::default()
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&infos);
-
+        let lut_info = lut.map(|view| self.colour_cube(view));
+        self.push_descriptors(buffer, layout, Some(surface_info), lut_info);
         unsafe {
-            handle.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, bound.pipeline);
-            device.push_descriptor().cmd_push_descriptor_set(
-                buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                layout,
-                0,
-                &[write],
-            );
+            handle.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             handle.cmd_push_constants(
                 buffer,
                 layout,

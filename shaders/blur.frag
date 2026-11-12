@@ -12,6 +12,7 @@
 //
 // Compile with:
 //   glslangValidator -V blur.frag -o blur.frag.spv
+//   glslangValidator -V blur.frag -DCOLOR_LUT -o blur.lut.frag.spv
 
 #version 450
 
@@ -25,6 +26,10 @@ layout(push_constant) uniform Push {
     vec4 csc1;
     vec4 csc2;
 } push;
+
+#ifdef COLOR_LUT
+layout(set = 0, binding = 1) uniform sampler3D color_lut;
+#endif
 
 layout(set = 0, binding = 0) uniform sampler2D source;
 
@@ -49,5 +54,14 @@ void main() {
     color += sample_at(vec2(-radius.x, -radius.y)) * 0.075114;
 
     // `misc.x` is alpha, as it is for the textured pipeline.
-    out_color = color * push.misc.x;
+    color *= push.misc.x;
+#ifdef COLOR_LUT
+    // The captured background is unmodified source colour; this draw is where
+    // it reaches the screen, so this is where the output's cube applies.
+    if (color.a > 0.0) {
+        vec3 rgb = texture(color_lut, clamp(color.rgb / color.a, vec3(0.0), vec3(1.0))).rgb;
+        color = vec4(rgb * color.a, color.a);
+    }
+#endif
+    out_color = color;
 }

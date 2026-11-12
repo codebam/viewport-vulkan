@@ -13,6 +13,7 @@
 //
 // Compile with:
 //   glslangValidator -V texture.frag -o texture.frag.spv
+//   glslangValidator -V texture.frag -DCOLOR_LUT -o texture.lut.frag.spv
 
 #version 450
 
@@ -35,6 +36,13 @@ const uint TRANSFER_PQ = 4u;
 const uint TRANSFER_HLG = 5u;
 
 layout(set = 0, binding = 0) uniform sampler2D surface;
+
+#ifdef COLOR_LUT
+// The output's own colour transform: an ICC profile, baked to a cube. Only
+// this variant of the shader declares it, which is why a display without a
+// profile keeps exactly the pipeline it always had.
+layout(set = 0, binding = 1) uniform sampler3D color_lut;
+#endif
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
@@ -151,6 +159,13 @@ void main() {
     linear = max(linear, vec3(0.0));
 
     vec3 encoded = from_linear(linear, dst_transfer);
+
+#ifdef COLOR_LUT
+    // After the parametric conversion, not instead of it: the cube describes
+    // the output, so it applies to whatever space the window declared rather
+    // than to sRGB alone.
+    encoded = texture(color_lut, clamp(encoded, vec3(0.0), vec3(1.0))).rgb;
+#endif
 
     out_color = vec4(encoded * a, a) * push.color * push.misc.x;
 }
