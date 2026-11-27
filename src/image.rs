@@ -114,6 +114,12 @@ impl Image {
         let fourcc = buffer.format().code;
         let modifier = u64::from(buffer.format().modifier);
         let size = buffer.size();
+        anyhow::ensure!(
+            size.w > 0 && size.h > 0,
+            "dmabuf has non-positive dimensions {}x{}",
+            size.w,
+            size.h
+        );
         let (width, height) = (size.w as u32, size.h as u32);
 
         let vk_format =
@@ -360,6 +366,10 @@ impl Image {
         height: u32,
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "image dimensions must be positive, got {width}x{height}"
+        );
         anyhow::ensure!(
             !format::is_yuv(fourcc),
             "multi-planar {fourcc:?} cannot be allocated as a single-plane image"
@@ -669,10 +679,13 @@ fn distinct_allocations(buffer: &Dmabuf) -> Result<Vec<usize>> {
 /// Import a plane's fd and allocate the memory behind it.
 ///
 /// `requirements` differs between the whole-image and per-plane cases, which is
-/// the only reason this is a parameter rather than read here.
+/// the only reason this is a parameter rather than read here. `dedicated_image`
+/// is `Some(image)` only for non-disjoint imports: Vulkan forbids naming a
+/// `VK_IMAGE_CREATE_DISJOINT_BIT` image in `VkMemoryDedicatedAllocateInfo`
+/// (`VUID-VkMemoryDedicatedAllocateInfo-image-01797`).
 fn import_plane(
     device: &Device,
-    image: vk::Image,
+    dedicated_image: Option<vk::Image>,
     fd: std::os::fd::BorrowedFd<'_>,
     requirements: vk::MemoryRequirements,
 ) -> Result<vk::DeviceMemory> {
@@ -697,15 +710,18 @@ fn import_plane(
     // vkAllocateMemory consumes the fd on success, so hand it a copy.
     let owned: OwnedFd = fd.try_clone_to_owned().context("dup dmabuf fd")?;
 
-    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let mut dedicated =
+        dedicated_image.map(|image| vk::MemoryDedicatedAllocateInfo::default().image(image));
     let mut import = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(HANDLE_TYPE)
         .fd(owned.as_raw_fd());
-    let allocate = vk::MemoryAllocateInfo::default()
+    let mut allocate = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type)
-        .push_next(&mut dedicated)
         .push_next(&mut import);
+    if let Some(info) = dedicated.as_mut() {
+        allocate = allocate.push_next(info);
+    }
 
     let memory =
         unsafe { device.handle().allocate_memory(&allocate, None) }.context("vkAllocateMemory")?;
@@ -723,7 +739,7 @@ fn bind_whole(device: &Device, image: vk::Image, buffer: &Dmabuf) -> Result<vk::
         .handles()
         .next()
         .ok_or_else(|| anyhow!("dmabuf has no planes"))?;
-    let memory = import_plane(device, image, fd, requirements)?;
+    let memory = import_plane(device, Some(image), fd, requirements)?;
     if let Err(e) = unsafe { handle.bind_image_memory(image, memory, 0) } {
         unsafe { handle.free_memory(memory, None) };
         return Err(anyhow::Error::from(e).context("vkBindImageMemory"));
@@ -774,7 +790,7 @@ fn bind_disjoint(
         let mut requirements = vk::MemoryRequirements2::default();
         unsafe { handle.get_image_memory_requirements2(&info, &mut requirements) };
 
-        match import_plane(device, image, fds[plane], requirements.memory_requirements) {
+        match import_plane(device, None, fds[plane], requirements.memory_requirements) {
             Ok(memory) => memories.push(memory),
             Err(e) => {
                 free_all(&memories);
