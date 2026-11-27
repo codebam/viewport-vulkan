@@ -428,7 +428,7 @@ impl VulkanRenderer {
                 &[barrier],
             );
         }
-        self.commands.submit()?;
+        self.commands.submit_unsignaled()?;
         Ok(())
     }
 }
@@ -744,7 +744,7 @@ impl VulkanRenderer {
             );
         }
 
-        self.commands.submit()?;
+        self.commands.submit_unsignaled()?;
         self.commands.wait(std::time::Duration::from_secs(5))?;
         Ok(())
     }
@@ -949,7 +949,7 @@ impl VulkanRenderer {
             );
         }
 
-        self.commands.submit()?;
+        self.commands.submit_unsignaled()?;
         self.commands.wait(std::time::Duration::from_secs(5))?;
 
         Ok(VulkanMapping {
@@ -2026,7 +2026,7 @@ impl Drop for VulkanFrame<'_, '_> {
                 .dynamic_rendering()
                 .cmd_end_rendering(self.renderer.commands.buffer());
         }
-        let _ = self.renderer.commands.submit();
+        let _ = self.renderer.commands.submit_unsignaled();
     }
 }
 
