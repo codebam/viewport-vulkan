@@ -1840,26 +1840,66 @@ impl Frame for VulkanFrame<'_, '_> {
         color: Color32F,
         at: &[Rectangle<i32, Physical>],
     ) -> Result<(), Self::Error> {
-        // A solid draw rather than vkCmdClearAttachments: the blend state is
-        // already right, and for an opaque colour — which is what a clear
-        // always is in practice — the result is identical.
-        //
-        // The rectangle is the *output* size, not the framebuffer's.
-        // draw_solid takes output-space coordinates and puts them through the
-        // transform, and the two sizes differ whenever the transform swaps
-        // axes — so using the framebuffer size here left a rotated output
-        // partly uncleared.
         // Nothing to clear. Not the same as "clear everything" — see
         // `scissors_within`.
         if at.is_empty() {
             return Ok(());
         }
         let whole = Rectangle::from_size(self.logical_size);
-        for rect in at {
-            // The destination is the whole output and the rectangle is the
-            // damage, so a clear of several regions is several draws of the
-            // same quad rather than several quads.
-            self.draw_solid(whole, std::slice::from_ref(rect), color)?;
+        let rects = self.scissors_within(whole, at);
+        if rects.is_empty() {
+            return Ok(());
+        }
+
+        // `Frame::clear` replaces pixels rather than alpha-blending over stale
+        // framebuffer contents. Use `vkCmdClearAttachments` directly when no
+        // colour LUT is active (or when clearing to transparent, where a LUT
+        // draw is a no-op anyway). When a LUT is active and `color.a() < 1.0`,
+        // wipe the region to transparent first so the subsequent LUT solid draw
+        // replaces rather than blends.
+        let use_lut = self.renderer.color_lut.is_some() && color.a() > 0.0;
+        if !use_lut || color.a() < 1.0 {
+            let clear_color = if use_lut {
+                [0.0, 0.0, 0.0, 0.0]
+            } else {
+                [color.r(), color.g(), color.b(), color.a()]
+            };
+            let attachment = vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                color_attachment: 0,
+                clear_value: vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: clear_color,
+                    },
+                },
+            };
+            let clear_rects: Vec<vk::ClearRect> = rects
+                .iter()
+                .map(|r| vk::ClearRect {
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: r.loc.x,
+                            y: r.loc.y,
+                        },
+                        extent: vk::Extent2D {
+                            width: r.size.w as u32,
+                            height: r.size.h as u32,
+                        },
+                    },
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .collect();
+            unsafe {
+                self.renderer.device.handle().cmd_clear_attachments(
+                    self.command_buffer(),
+                    &[attachment],
+                    &clear_rects,
+                );
+            }
+        }
+        if use_lut {
+            self.draw_solid(whole, at, color)?;
         }
         Ok(())
     }
@@ -2129,15 +2169,26 @@ impl Drop for VulkanFrame<'_, '_> {
         if self.finished {
             return;
         }
-        // A dropped frame has an open render pass and an unsubmitted command
-        // buffer. Ending and submitting is the least surprising of the
-        // behaviours the trait permits: the alternative leaves the next
-        // `begin` re-recording a buffer mid-pass.
+        // A dropped frame has an open render pass, an unreleased render target
+        // in COLOR_ATTACHMENT_OPTIMAL, and an unsubmitted command buffer. End
+        // the pass and release the target back to GENERAL / FOREIGN_EXT so the
+        // next frame or readback sees the expected layout and ownership.
+        let target = self.framebuffer.image.clone();
+        let buffer = self.renderer.commands.buffer();
         let device = self.renderer.device.clone();
+        let handle = device.handle();
         unsafe {
-            device
-                .dynamic_rendering()
-                .cmd_end_rendering(self.renderer.commands.buffer());
+            device.dynamic_rendering().cmd_end_rendering(buffer);
+            let release = target.release_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            handle.cmd_pipeline_barrier(
+                buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[release],
+            );
         }
         let _ = self.renderer.commands.submit_unsignaled();
     }
@@ -2944,6 +2995,61 @@ mod tests {
             [0, 255, 0, 255],
             "an empty clear wiped the frame"
         );
+    }
+
+    #[test]
+    fn clearing_to_transparent_replaces_existing_pixels() {
+        let Some(mut h) = harness() else { return };
+        let mut target = buffer(&mut h.allocator, 32, 32);
+
+        {
+            let mut framebuffer = h.renderer.bind(&mut target).expect("bind");
+            let mut frame = h
+                .renderer
+                .render(&mut framebuffer, (32, 32).into(), Transform::Normal)
+                .expect("render");
+            frame
+                .clear(Color32F::from([0.0, 1.0, 0.0, 1.0]), &all(32, 32))
+                .expect("opaque clear");
+            let _ = frame.finish().expect("finish");
+        }
+        assert_eq!(pixel(&target, 16, 16), [0, 255, 0, 255]);
+
+        {
+            let mut framebuffer = h.renderer.bind(&mut target).expect("bind");
+            let mut frame = h
+                .renderer
+                .render(&mut framebuffer, (32, 32).into(), Transform::Normal)
+                .expect("render");
+            frame
+                .clear(Color32F::from([0.0, 0.0, 0.0, 0.0]), &all(32, 32))
+                .expect("transparent clear");
+            let _ = frame.finish().expect("finish");
+        }
+        assert_eq!(
+            pixel(&target, 16, 16),
+            [0, 0, 0, 0],
+            "clearing to transparent must replace pixels rather than blend"
+        );
+    }
+
+    #[test]
+    fn dropping_an_unfinished_frame_releases_its_target_back_to_foreign() {
+        let Some(mut h) = harness() else { return };
+        let mut target = buffer(&mut h.allocator, 32, 32);
+
+        let mut framebuffer = h.renderer.bind(&mut target).expect("bind");
+        let image = framebuffer.image().clone();
+        {
+            let _frame = h
+                .renderer
+                .render(&mut framebuffer, (32, 32).into(), Transform::Normal)
+                .expect("render");
+            // Drop without calling finish().
+        }
+        // The drop path must have released the image back to FOREIGN_EXT.
+        let next = image.acquire_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        assert_eq!(next.src_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
     }
 
     #[test]
