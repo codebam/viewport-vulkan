@@ -176,34 +176,37 @@ impl ImportMemWl for VulkanRenderer {
         // a new image per commit would mean an allocation and a full upload
         // every frame for every shm surface, which is the whole cost of the
         // shm path doubled.
-        // Every other cached buffer has now missed this commit.
-        for entry in self
-            .shm
-            .iter_mut()
-            .filter(|e| e.surface_id == surface_id && e.id != id)
-        {
-            if entry.pending.len() < MAX_PENDING {
-                entry.pending.extend_from_slice(damage);
+        // Every other cached buffer belonging to this surface has now missed
+        // this commit. Surfaceless imports (`surface_id == None`) do not share
+        // a commit history with each other.
+        if surface_id.is_some() {
+            for entry in self
+                .shm
+                .iter_mut()
+                .filter(|e| e.surface_id == surface_id && e.id != id)
+            {
+                if entry.pending.len() < MAX_PENDING {
+                    entry.pending.extend_from_slice(damage);
+                }
             }
         }
 
-        let found = self
-            .shm
-            .iter_mut()
-            .find(|e| {
-                e.id == id
-                    && e.surface_id == surface_id
-                    && e.texture.width() as i32 == width
-                    && e.texture.height() as i32 == height
-                    && e.texture.image().fourcc() == fourcc
-            })
-            .map(|e| (e.texture.clone(), std::mem::take(&mut e.pending)));
+        let found = self.shm.iter().position(|e| {
+            e.id == id
+                && e.surface_id == surface_id
+                && e.texture.width() as i32 == width
+                && e.texture.height() as i32 == height
+                && e.texture.image().fourcc() == fourcc
+        });
 
-        if let Some((texture, pending)) = found {
+        if let Some(index) = found {
+            let texture = self.shm[index].texture.clone();
             let whole = Rectangle::from_size((width, height).into());
-            for region in plan_upload(damage, &pending, whole) {
+            let regions = plan_upload(damage, &self.shm[index].pending, whole);
+            for region in regions {
                 self.update_memory(&texture, &pixels, region)?;
             }
+            self.shm[index].pending.clear();
             return Ok(described(texture, surface, self.sdr));
         }
 
@@ -261,12 +264,37 @@ pub(crate) type ShmCache = Vec<ShmEntry>;
 /// them, and much cheaper than getting the bookkeeping wrong.
 const MAX_PENDING: usize = 32;
 
+/// Clip a damage rectangle to `whole` without overflowing on `i32::MAX` extents.
+fn clip_to_buffer(
+    rect: Rectangle<i32, BufferCoord>,
+    whole: Rectangle<i32, BufferCoord>,
+) -> Option<Rectangle<i32, BufferCoord>> {
+    if rect.size.w <= 0 || rect.size.h <= 0 || whole.size.w <= 0 || whole.size.h <= 0 {
+        return None;
+    }
+    let x0 = i64::from(rect.loc.x).max(i64::from(whole.loc.x));
+    let y0 = i64::from(rect.loc.y).max(i64::from(whole.loc.y));
+    let x1 = (i64::from(rect.loc.x) + i64::from(rect.size.w))
+        .min(i64::from(whole.loc.x) + i64::from(whole.size.w));
+    let y1 = (i64::from(rect.loc.y) + i64::from(rect.size.h))
+        .min(i64::from(whole.loc.y) + i64::from(whole.size.h));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(Rectangle::new(
+        (x0 as i32, y0 as i32).into(),
+        ((x1 - x0) as i32, (y1 - y0) as i32).into(),
+    ))
+}
+
 /// What to upload into a returning buffer: this commit's damage, and every
 /// commit it missed while another buffer was in use.
 ///
 /// An empty result means nothing changed and the upload can be skipped, which
 /// the trait allows. A `pending` list at the limit means take the whole
-/// buffer instead of replaying a long history.
+/// buffer instead of replaying a long history. Every region is clipped to
+/// `whole` because Wayland clients may pass oversized or out-of-bounds damage
+/// (such as `0, 0, i32::MAX, i32::MAX`) and empty rectangles.
 fn plan_upload(
     damage: &[Rectangle<i32, BufferCoord>],
     pending: &[Rectangle<i32, BufferCoord>],
@@ -275,7 +303,11 @@ fn plan_upload(
     if pending.len() >= MAX_PENDING {
         return vec![whole];
     }
-    damage.iter().chain(pending.iter()).copied().collect()
+    damage
+        .iter()
+        .chain(pending.iter())
+        .filter_map(|&rect| clip_to_buffer(rect, whole))
+        .collect()
 }
 
 #[cfg(test)]
@@ -305,6 +337,26 @@ mod tests {
         // No damage and nothing missed: the client says the buffer is
         // unchanged and the upload is skipped entirely.
         assert!(plan_upload(&[], &[], rect(0, 0, 100, 100)).is_empty());
+    }
+
+    #[test]
+    fn oversized_negative_and_empty_damage_are_clipped_to_the_buffer() {
+        let whole = rect(0, 0, 100, 50);
+        let plan = plan_upload(
+            &[
+                // Common Wayland "damage everything" sentinel with non-zero origin.
+                rect(10, 5, i32::MAX, i32::MAX),
+                // Partially negative origin.
+                rect(-20, -10, 30, 25),
+                // Completely outside or empty.
+                rect(100, 0, 20, 20),
+                rect(-50, 0, 50, 50),
+                rect(0, 0, 0, 10),
+            ],
+            &[],
+            whole,
+        );
+        assert_eq!(plan, vec![rect(10, 5, 90, 45), rect(0, 0, 10, 15)]);
     }
 
     #[test]
