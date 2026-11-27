@@ -132,7 +132,15 @@ pub fn framebuffer_rect(
     // Two opposite corners are enough: every transform is axis-aligned, so the
     // image of a rectangle is a rectangle.
     let (x0, y0) = corner(rect.loc.x, rect.loc.y);
-    let (x1, y1) = corner(rect.loc.x + rect.size.w, rect.loc.y + rect.size.h);
+    let x_end = (i64::from(rect.loc.x) + i64::from(rect.size.w)) as f32;
+    let y_end = (i64::from(rect.loc.y) + i64::from(rect.size.h)) as f32;
+    let (x1, y1) = {
+        let (cx, cy) = clip(x_end, y_end, output_size, transform);
+        (
+            (cx + 1.0) * 0.5 * output_size.w as f32,
+            (cy + 1.0) * 0.5 * output_size.h as f32,
+        )
+    };
 
     let loc = Point::<i32, Physical>::from((x0.min(x1).round() as i32, y0.min(y1).round() as i32));
     let size = Size::<i32, Physical>::from((
@@ -157,25 +165,40 @@ pub fn texture(
     transform: Transform,
     flipped: bool,
 ) -> Affine {
-    let inverse = transform.invert();
-    // The region's extent as the surface sees it, which is the source space
-    // the corner lives in before the transform is applied.
-    let extent = inverse.transform_size(Size::<f64, smithay::utils::Buffer>::from((
+    // The region's extent as the surface sees it, matching Smithay's
+    // `build_texture_mat` in `gles/mod.rs`. Using `Transform::matrix()`
+    // directly rather than `transform.invert().transform_point_in(...)` avoids
+    // the 180-degree disagreement on `Flipped90` and `Flipped270`, where
+    // `Transform::invert()` swaps the two involutions.
+    let extent = transform.transform_size(Size::<f64, smithay::utils::Buffer>::from((
         src.size.w, src.size.h,
     )));
+    let m = transform.matrix().to_cols_array();
+    let (tx, ty) = match transform {
+        Transform::Normal => (0.0, 0.0),
+        Transform::_90 => (0.0, extent.w),
+        Transform::_180 => (extent.w, extent.h),
+        Transform::_270 => (extent.h, 0.0),
+        Transform::Flipped => (extent.w, 0.0),
+        Transform::Flipped90 => (0.0, 0.0),
+        Transform::Flipped180 => (0.0, extent.h),
+        Transform::Flipped270 => (extent.h, extent.w),
+    };
 
     let (tw, th) = texture_size;
 
     let to_uv = |u: f64, v: f64| -> (f32, f32) {
-        let v = if flipped { 1.0 - v } else { v };
-        let point = inverse.transform_point_in(
-            Point::<f64, smithay::utils::Buffer>::from((u * extent.w, v * extent.h)),
-            &extent,
-        );
-        (
-            ((src.loc.x + point.x) / tw) as f32,
-            ((src.loc.y + point.y) / th) as f32,
-        )
+        let sx = u * extent.w;
+        let sy = v * extent.h;
+        let px = f64::from(m[0]) * sx + f64::from(m[2]) * sy + tx;
+        let py = f64::from(m[1]) * sx + f64::from(m[3]) * sy + ty;
+        let uv_x = (src.loc.x + px) / tw;
+        let uv_y = (src.loc.y + py) / th;
+        // `flipped` (`y_inverted`) means the buffer's rows run bottom-up in
+        // texture space, so it flips the final texture V coordinate rather than
+        // surface V before rotation.
+        let uv_y = if flipped { 1.0 - uv_y } else { uv_y };
+        (uv_x as f32, uv_y as f32)
     };
 
     Affine::from_corners(to_uv(0.0, 0.0), to_uv(1.0, 0.0), to_uv(0.0, 1.0))
@@ -419,6 +442,72 @@ mod tests {
                 vec![(0, 0), (0, 1), (1, 0), (1, 1)],
                 "{transform:?} does not sample the texture exactly once"
             );
+        }
+    }
+
+    #[test]
+    fn flipped_rotations_match_smithays_texture_matrix_and_are_not_inverted() {
+        // Flipped90 maps quad (0,0) -> (0,0) and (1,0) -> (0,1); Flipped270
+        // maps (0,0) -> (1,1) and (1,0) -> (1,0). Going through
+        // `Transform::invert().transform_point_in(...)` swapped the two.
+        let src = Rectangle::from_size(Size::from((64.0, 32.0)));
+        let f90 = texture(src, (64.0, 32.0), Transform::Flipped90, false);
+        assert!(close(f90.apply(0.0, 0.0), (0.0, 0.0)), "Flipped90 (0,0)");
+        assert!(close(f90.apply(1.0, 0.0), (0.0, 1.0)), "Flipped90 (1,0)");
+        assert!(close(f90.apply(0.0, 1.0), (1.0, 0.0)), "Flipped90 (0,1)");
+
+        let f270 = texture(src, (64.0, 32.0), Transform::Flipped270, false);
+        assert!(close(f270.apply(0.0, 0.0), (1.0, 1.0)), "Flipped270 (0,0)");
+        assert!(close(f270.apply(1.0, 0.0), (1.0, 0.0)), "Flipped270 (1,0)");
+        assert!(close(f270.apply(0.0, 1.0), (0.0, 1.0)), "Flipped270 (0,1)");
+    }
+
+    #[test]
+    fn a_y_inverted_rotated_texture_flips_in_buffer_space() {
+        // `_90` without flip maps (0,0) -> (0,1), (1,0) -> (0,0), (0,1) -> (1,1).
+        // `y_inverted` flips texture V -> 1 - V after the transform, so (0,0)
+        // must move to (0,0), (1,0) to (0,1), and (0,1) to (1,0).
+        let src = Rectangle::from_size(Size::from((64.0, 32.0)));
+        let rotated_flipped = texture(src, (64.0, 32.0), Transform::_90, true);
+        assert!(close(rotated_flipped.apply(0.0, 0.0), (0.0, 0.0)));
+        assert!(close(rotated_flipped.apply(1.0, 0.0), (0.0, 1.0)));
+        assert!(close(rotated_flipped.apply(0.0, 1.0), (1.0, 0.0)));
+    }
+
+    #[test]
+    fn blur_sampling_with_inverse_output_transform_matches_framebuffer_pixels() {
+        // For every output transform, a full-screen quad drawn with `position`
+        // and sampled with `texture(..., transform.invert(), false)` must land
+        // every desktop corner on the exact framebuffer UV where `position`
+        // placed it.
+        let fb = Size::<i32, Physical>::from((80, 40));
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let desktop = transform.transform_size(fb);
+            let pos = position(Rectangle::from_size(desktop), fb, transform);
+            let uv = texture(
+                Rectangle::from_size(Size::from((fb.w as f64, fb.h as f64))),
+                (fb.w as f64, fb.h as f64),
+                transform.invert(),
+                false,
+            );
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                let (cx, cy) = pos.apply(u, v);
+                let fb_uv = ((cx + 1.0) * 0.5, (cy + 1.0) * 0.5);
+                let sampled = uv.apply(u, v);
+                assert!(
+                    close(sampled, fb_uv),
+                    "{transform:?} at ({u},{v}): pos landed at {fb_uv:?} but blur sampled {sampled:?}"
+                );
+            }
         }
     }
 }
