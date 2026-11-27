@@ -940,20 +940,41 @@ impl VulkanRenderer {
         let command = self.commands.begin()?;
         let handle = self.device.handle();
 
-        let to_src = image.transition(
-            from_layout,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_READ,
-        );
+        // A framebuffer released by `Frame::finish` (or freshly bound) is owned
+        // by `VK_QUEUE_FAMILY_FOREIGN_EXT`; acquire before copying and release
+        // back to `FOREIGN_EXT` so scanout/external consumers see valid
+        // ownership afterwards.
+        let was_foreign = image.take_foreign();
+        let to_src = if was_foreign {
+            image.acquire_foreign_barrier(
+                from_layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        } else {
+            image.transition(
+                from_layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        };
         // Put it back, because a copy must not be destructive: the framebuffer
         // may be scanned out and the texture may be drawn again.
-        let restore = image.transition(
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            from_layout,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::AccessFlags::empty(),
-        );
+        let restore = if was_foreign {
+            image.release_barrier_with(
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                from_layout,
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        } else {
+            image.transition(
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                from_layout,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::empty(),
+            )
+        };
 
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(0)
@@ -1123,37 +1144,69 @@ impl smithay::backend::renderer::Blit for VulkanRenderer {
                     .to_owned(),
             ));
         }
+        let [src_start, src_end] =
+            validate_blit_rect("source", src, source.width(), source.height())?;
+        let [dst_start, dst_end] =
+            validate_blit_rect("destination", dst, target.width(), target.height())?;
 
         let command = self.commands.begin()?;
         let handle = self.device.handle();
 
         // Both start in GENERAL, which is where release_barrier leaves an
-        // image and where an externally written one is.
-        let to_src = source.transition(
-            vk::ImageLayout::GENERAL,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_READ,
-        );
-        let to_dst = target.transition(
-            vk::ImageLayout::GENERAL,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-        );
+        // image and where an externally written one is. Acquire from
+        // `VK_QUEUE_FAMILY_FOREIGN_EXT` whenever foreign, and release back
+        // afterwards so external readers (e.g. screencopy or KMS) observe
+        // completed transfers and valid ownership.
+        let src_foreign = source.take_foreign();
+        let dst_foreign = target.take_foreign();
+        let to_src = if src_foreign {
+            source.acquire_foreign_barrier(
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        } else {
+            source.transition(
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        };
+        let to_dst = if dst_foreign {
+            target.acquire_foreign_barrier(
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+            )
+        } else {
+            target.transition(
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            )
+        };
         // Put both back: a blit must leave the source intact and the
         // destination usable by whoever holds it.
-        let restore_src = source.transition(
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::ImageLayout::GENERAL,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::AccessFlags::empty(),
-        );
-        let restore_dst = target.transition(
+        let restore_src = if src_foreign {
+            source.release_barrier_with(
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+                vk::AccessFlags::TRANSFER_READ,
+            )
+        } else {
+            source.transition(
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::empty(),
+            )
+        };
+        let restore_dst = target.release_barrier_with(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::GENERAL,
             vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::empty(),
         );
 
         let layers = vk::ImageSubresourceLayers {
@@ -1164,31 +1217,9 @@ impl smithay::backend::renderer::Blit for VulkanRenderer {
         };
         let region = vk::ImageBlit::default()
             .src_subresource(layers)
-            .src_offsets([
-                vk::Offset3D {
-                    x: src.loc.x,
-                    y: src.loc.y,
-                    z: 0,
-                },
-                vk::Offset3D {
-                    x: src.loc.x + src.size.w,
-                    y: src.loc.y + src.size.h,
-                    z: 1,
-                },
-            ])
+            .src_offsets([src_start, src_end])
             .dst_subresource(layers)
-            .dst_offsets([
-                vk::Offset3D {
-                    x: dst.loc.x,
-                    y: dst.loc.y,
-                    z: 0,
-                },
-                vk::Offset3D {
-                    x: dst.loc.x + dst.size.w,
-                    y: dst.loc.y + dst.size.h,
-                    z: 1,
-                },
-            ]);
+            .dst_offsets([dst_start, dst_end]);
 
         // vkCmdBlitImage scales, which is the reason to use it over a plain
         // copy: the sizes are allowed to differ.
@@ -1239,21 +1270,64 @@ impl smithay::backend::renderer::Blit for VulkanRenderer {
     }
 }
 
-/// Intersect two physical rectangles without overflowing `i32` endpoints,
-/// returning `None` when the intersection is empty.
-fn clip_physical_rect(
+/// Validate a `vkCmdBlitImage` rectangle against `width`×`height` without
+/// overflowing `i32` endpoints.
+fn validate_blit_rect(
+    role: &str,
     rect: Rectangle<i32, Physical>,
+    width: u32,
+    height: u32,
+) -> Result<[vk::Offset3D; 2], Error> {
+    if rect.loc.x < 0 || rect.loc.y < 0 || rect.size.w <= 0 || rect.size.h <= 0 {
+        return Err(Error::Unsupported(format!(
+            "{role} blit rectangle {rect:?} has non-positive size or negative origin"
+        )));
+    }
+    let end_x = i64::from(rect.loc.x) + i64::from(rect.size.w);
+    let end_y = i64::from(rect.loc.y) + i64::from(rect.size.h);
+    if end_x > i64::from(width) || end_y > i64::from(height) {
+        return Err(Error::Unsupported(format!(
+            "{role} blit rectangle {rect:?} exceeds {width}x{height} image bounds"
+        )));
+    }
+    Ok([
+        vk::Offset3D {
+            x: rect.loc.x,
+            y: rect.loc.y,
+            z: 0,
+        },
+        vk::Offset3D {
+            x: end_x as i32,
+            y: end_y as i32,
+            z: 1,
+        },
+    ])
+}
+
+/// Translate `rect` by `origin` and intersect with `bounds` using `i64`
+/// endpoints so extreme damage values cannot overflow `i32`.
+fn translate_and_clip_rect(
+    rect: Rectangle<i32, Physical>,
+    origin: smithay::utils::Point<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
 ) -> Option<Rectangle<i32, Physical>> {
     if rect.size.w <= 0 || rect.size.h <= 0 || bounds.size.w <= 0 || bounds.size.h <= 0 {
         return None;
     }
-    let x0 = i64::from(rect.loc.x).max(i64::from(bounds.loc.x));
-    let y0 = i64::from(rect.loc.y).max(i64::from(bounds.loc.y));
-    let x1 = (i64::from(rect.loc.x) + i64::from(rect.size.w))
-        .min(i64::from(bounds.loc.x) + i64::from(bounds.size.w));
-    let y1 = (i64::from(rect.loc.y) + i64::from(rect.size.h))
-        .min(i64::from(bounds.loc.y) + i64::from(bounds.size.h));
+    let rx0 = i64::from(rect.loc.x) + i64::from(origin.x);
+    let ry0 = i64::from(rect.loc.y) + i64::from(origin.y);
+    let rx1 = rx0 + i64::from(rect.size.w);
+    let ry1 = ry0 + i64::from(rect.size.h);
+
+    let bx0 = i64::from(bounds.loc.x);
+    let by0 = i64::from(bounds.loc.y);
+    let bx1 = bx0 + i64::from(bounds.size.w);
+    let by1 = by0 + i64::from(bounds.size.h);
+
+    let x0 = rx0.max(bx0);
+    let y0 = ry0.max(by0);
+    let x1 = rx1.min(bx1);
+    let y1 = ry1.min(by1);
     if x1 <= x0 || y1 <= y0 {
         return None;
     }
@@ -1261,6 +1335,15 @@ fn clip_physical_rect(
         (x0 as i32, y0 as i32).into(),
         ((x1 - x0) as i32, (y1 - y0) as i32).into(),
     ))
+}
+
+/// Intersect two physical rectangles without overflowing `i32` endpoints,
+/// returning `None` when the intersection is empty.
+fn clip_physical_rect(
+    rect: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    translate_and_clip_rect(rect, (0, 0).into(), bounds)
 }
 
 /// A frame in progress.
@@ -1297,6 +1380,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         output_size: Size<i32, Physical>,
         transform: Transform,
     ) -> Result<Self, Error> {
+        if output_size.w <= 0 || output_size.h <= 0 {
+            return Err(Error::Unsupported(format!(
+                "output size must be positive, got {output_size:?}"
+            )));
+        }
         let target = framebuffer.image.clone();
         let buffer = renderer.commands.begin()?;
         let device = renderer.device.clone();
@@ -1401,7 +1489,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // was damaged that frame is drawn back.
         let clipped: Vec<Rectangle<i32, Physical>> = damage
             .iter()
-            .filter_map(|rect| Rectangle::new(rect.loc + dst.loc, rect.size).intersection(dst))
+            .filter_map(|rect| translate_and_clip_rect(*rect, dst.loc, dst))
             .collect();
 
         // Still desktop space at this point. The scissor is in framebuffer
@@ -1566,6 +1654,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 "the capture target's modifier does not support being sampled".to_owned(),
             ));
         }
+        let [src_start, src_end] =
+            validate_blit_rect("source", src, source.width(), source.height())?;
+        let [dst_start, dst_end] = validate_blit_rect("capture", dst, to.width(), to.height())?;
 
         self.end_rendering();
 
@@ -1581,21 +1672,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // this scratch buffer was already sampled by an earlier blur in this
         // frame, synchronize against prior fragment shader reads before writing.
         let to_dst = if to.take_foreign() {
-            vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(self.renderer.device.queue_family())
-                .image(to.handle())
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
+            to.acquire_foreign_barrier(
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+            )
         } else {
             to.transition(
                 vk::ImageLayout::GENERAL,
@@ -1625,31 +1706,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         };
         let region = vk::ImageBlit::default()
             .src_subresource(layers)
-            .src_offsets([
-                vk::Offset3D {
-                    x: src.loc.x,
-                    y: src.loc.y,
-                    z: 0,
-                },
-                vk::Offset3D {
-                    x: src.loc.x + src.size.w,
-                    y: src.loc.y + src.size.h,
-                    z: 1,
-                },
-            ])
+            .src_offsets([src_start, src_end])
             .dst_subresource(layers)
-            .dst_offsets([
-                vk::Offset3D {
-                    x: dst.loc.x,
-                    y: dst.loc.y,
-                    z: 0,
-                },
-                vk::Offset3D {
-                    x: dst.loc.x + dst.size.w,
-                    y: dst.loc.y + dst.size.h,
-                    z: 1,
-                },
-            ]);
+            .dst_offsets([dst_start, dst_end]);
         let filter = match filter {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
@@ -1710,33 +1769,28 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         }
 
         let position = crate::transform::position(dst, self.output_size, self.transform);
+        // The capture texture holds framebuffer pixels, which are already in
+        // `self.transform` orientation. Un-rotate by `self.transform.invert()`
+        // when sampling so rotated and flipped outputs sample the matching
+        // background pixels rather than drawing the blur sideways.
         let texcoord = crate::transform::texture(
             src,
             (texture.width() as f64, texture.height() as f64),
-            Transform::Normal,
+            self.transform.invert(),
             false,
         );
         let push = crate::pipeline::Push::new(position, texcoord, [1.0, 1.0, 1.0, 1.0], alpha);
 
         let target_format = self.framebuffer.image.format();
-        // The capture behind a translucent surface is unmodified source
-        // colour; this draw is where it reaches the screen, so this is where
-        // the output's cube applies.
-        let lut = self.renderer.color_lut.as_ref().map(|lut| lut.view());
-        let (pipeline, layout) = match lut {
-            Some(_) => (
-                self.renderer
-                    .pipelines
-                    .lut(target_format, crate::pipeline::Kind::Blur)?,
-                self.renderer.pipelines.lut_layout(),
-            ),
-            None => (
-                self.renderer
-                    .pipelines
-                    .get(target_format, crate::pipeline::Kind::Blur)?,
-                self.renderer.pipelines.layout(),
-            ),
-        };
+        // The captured background came from the current framebuffer, whose
+        // surfaces and solids already passed through the output's colour cube
+        // when they were drawn. Applying the LUT a second time here would
+        // double-correct blurred regions.
+        let pipeline = self
+            .renderer
+            .pipelines
+            .get(target_format, crate::pipeline::Kind::Blur)?;
+        let layout = self.renderer.pipelines.layout();
         let sampler = self.renderer.pipelines.sampler();
         let buffer = self.command_buffer();
         let device = self.renderer.device.clone();
@@ -1748,8 +1802,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // The capture leaves it here; `SHADER_READ_ONLY_OPTIMAL` would be
             // a lie the driver may or may not notice.
             .image_layout(vk::ImageLayout::GENERAL);
-        let lut_info = lut.map(|view| self.colour_cube(view));
-        self.push_descriptors(buffer, layout, Some(surface_info), lut_info);
+        self.push_descriptors(buffer, layout, Some(surface_info), None);
         unsafe {
             handle.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             handle.cmd_push_constants(
@@ -2211,6 +2264,59 @@ mod tests {
     fn errors_carry_their_cause() {
         let error = Error::Unsupported("output transform 90 is not implemented".to_owned());
         assert!(error.to_string().contains("transform"));
+    }
+
+    #[test]
+    fn validate_blit_rect_rejects_negative_empty_and_out_of_bounds_rects() {
+        assert!(validate_blit_rect(
+            "src",
+            Rectangle::new((0, 0).into(), (16, 16).into()),
+            16,
+            16
+        )
+        .is_ok());
+        assert!(
+            validate_blit_rect("src", Rectangle::new((-1, 0).into(), (4, 4).into()), 16, 16)
+                .is_err()
+        );
+        assert!(
+            validate_blit_rect("src", Rectangle::new((0, 0).into(), (0, 4).into()), 16, 16)
+                .is_err()
+        );
+        assert!(validate_blit_rect(
+            "src",
+            Rectangle::new((10, 0).into(), (10, 4).into()),
+            16,
+            16
+        )
+        .is_err());
+        assert!(validate_blit_rect(
+            "src",
+            Rectangle::new((1, 0).into(), (i32::MAX, 4).into()),
+            16,
+            16
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn translate_and_clip_rect_handles_extreme_damage_without_overflow() {
+        let dst = Rectangle::new((-2560, 0).into(), (5120, 1440).into());
+        // Full-extent Wayland damage sentinel at i32::MAX must not overflow.
+        let clipped = translate_and_clip_rect(
+            Rectangle::new((0, 0).into(), (i32::MAX, i32::MAX).into()),
+            dst.loc,
+            dst,
+        );
+        assert_eq!(clipped, Some(dst));
+
+        // Extreme negative offset outside dst clips cleanly to None.
+        let off = translate_and_clip_rect(
+            Rectangle::new((i32::MIN, 0).into(), (100, 100).into()),
+            dst.loc,
+            dst,
+        );
+        assert_eq!(off, None);
     }
 
     struct Harness {

@@ -529,6 +529,58 @@ impl Image {
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Build a barrier handing this image back to `VK_QUEUE_FAMILY_FOREIGN_EXT`
+    /// in `to` layout with an explicit `src_access` mask.
+    pub(crate) fn release_barrier_with(
+        &self,
+        from: vk::ImageLayout,
+        to: vk::ImageLayout,
+        src_access: vk::AccessFlags,
+    ) -> vk::ImageMemoryBarrier<'static> {
+        self.foreign
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(vk::AccessFlags::empty())
+            .old_layout(from)
+            .new_layout(to)
+            .src_queue_family_index(self.device.queue_family())
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .image(self.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+    }
+
+    /// Build an acquire barrier from `VK_QUEUE_FAMILY_FOREIGN_EXT` into this
+    /// device's graphics queue with an explicit `dst_access` mask.
+    pub(crate) fn acquire_foreign_barrier(
+        &self,
+        from: vk::ImageLayout,
+        to: vk::ImageLayout,
+        dst_access: vk::AccessFlags,
+    ) -> vk::ImageMemoryBarrier<'static> {
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(dst_access)
+            .old_layout(from)
+            .new_layout(to)
+            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .dst_queue_family_index(self.device.queue_family())
+            .image(self.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+    }
+
     /// A barrier handing the image back to whoever will consume it next.
     ///
     /// After rendering, the image goes to KMS, to another API, or to a CPU
