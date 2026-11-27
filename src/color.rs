@@ -202,6 +202,10 @@ impl Primaries {
     /// three columns, and the white point fixes their lengths — because the
     /// definition of a colour space's white is that equal RGB lands on it.
     pub fn to_xyz(&self) -> [[f32; 3]; 3] {
+        let valid = |(x, y): (f32, f32)| x.is_finite() && y.is_finite() && y > 1e-6;
+        if !valid(self.red) || !valid(self.green) || !valid(self.blue) || !valid(self.white) {
+            return IDENTITY;
+        }
         let xyz = |(x, y): (f32, f32)| -> [f32; 3] {
             // Y is normalised to 1; the chromaticity only fixes the ratios.
             [x / y, 1.0, (1.0 - x - y) / y]
@@ -218,7 +222,7 @@ impl Primaries {
             Some(inverse) => multiply_vector(&inverse, w),
             // Degenerate primaries. Returning the identity keeps the renderer
             // running with the wrong gamut rather than failing a frame.
-            None => [1.0, 1.0, 1.0],
+            None => return IDENTITY,
         };
 
         [
@@ -252,19 +256,31 @@ impl Primaries {
 /// changing what 1.0 means, and treating them as if they already agreed is
 /// what encoded an SDR desktop as 10,000 nits — every pixel driven to the
 /// panel's limit, which is the washed-out white an HDR output showed.
+/// Clamp a caller-supplied reference luminance to a safe positive value so a
+/// malformed description cannot inject `NaN` or infinity into shader constants.
+fn safe_reference_luminance(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        203.0
+    }
+}
+
 pub fn luminance_scale(from: &Description, to: &Description) -> f32 {
     /// What PQ's 1.0 means, in cd/m².
     const PQ_PEAK: f32 = 10_000.0;
 
+    let from_ref = safe_reference_luminance(from.reference_luminance);
+    let to_ref = safe_reference_luminance(to.reference_luminance);
     match (from.transfer.is_absolute(), to.transfer.is_absolute()) {
         // Both relative, or both absolute: only the reference whites differ.
-        (false, false) => from.reference_luminance / to.reference_luminance,
+        (false, false) => from_ref / to_ref,
         (true, true) => 1.0,
         // Relative into absolute: SDR white is `reference_luminance` nits, and
         // PQ wants that as a fraction of 10,000.
-        (false, true) => from.reference_luminance / PQ_PEAK,
+        (false, true) => from_ref / PQ_PEAK,
         // Absolute into relative: the other way about.
-        (true, false) => PQ_PEAK / to.reference_luminance,
+        (true, false) => PQ_PEAK / to_ref,
     }
 }
 
@@ -349,7 +365,7 @@ pub fn encodable_peak(description: &Description) -> f32 {
     if description.transfer.is_absolute() {
         PQ_PEAK_LUMINANCE
     } else {
-        description.reference_luminance
+        safe_reference_luminance(description.reference_luminance)
     }
 }
 
@@ -432,6 +448,7 @@ impl SdrEotf {
 pub struct SurfaceTonemap(pub std::sync::Mutex<Option<TonemapMode>>);
 
 /// The tone-mapping rule a surface carries, if it carries one.
+#[cfg(feature = "wayland")]
 pub fn tonemap_in(states: &smithay::wayland::compositor::SurfaceData) -> Option<TonemapMode> {
     states
         .data_map
@@ -444,6 +461,7 @@ pub fn tonemap_in(states: &smithay::wayland::compositor::SurfaceData) -> Option<
 /// The difference matters for [`SdrEotf`]: a client that declared sRGB is not
 /// the same as one that declared nothing, and the forced mode treats them
 /// differently.
+#[cfg(feature = "wayland")]
 pub fn declared_in(states: &smithay::wayland::compositor::SurfaceData) -> Option<Description> {
     states
         .data_map
@@ -466,6 +484,7 @@ pub struct SurfaceColor(pub std::sync::Mutex<Option<Description>>);
 ///
 /// The default is not a guess so much as the protocol's own answer: a client
 /// that has not said anything is required to be treated as sRGB.
+#[cfg(feature = "wayland")]
 pub fn description_for(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Description {
@@ -473,6 +492,7 @@ pub fn description_for(
 }
 
 /// The same, from a surface's state rather than the surface.
+#[cfg(feature = "wayland")]
 pub fn description_in(states: &smithay::wayland::compositor::SurfaceData) -> Description {
     declared_in(states).unwrap_or_default()
 }
@@ -553,6 +573,7 @@ impl Representation {
 pub struct SurfaceRepresentation(pub std::sync::Mutex<Option<Representation>>);
 
 /// What a surface's Y′CbCr buffers mean, as far as its client has said.
+#[cfg(feature = "wayland")]
 pub fn representation_in(
     states: &smithay::wayland::compositor::SurfaceData,
 ) -> Option<Representation> {
@@ -606,7 +627,7 @@ fn invert(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     let determinant = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if determinant.abs() < 1e-9 {
+    if !determinant.is_finite() || determinant.abs() < 1e-9 {
         return None;
     }
     let inverse = 1.0 / determinant;
@@ -940,5 +961,39 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), codes.len(), "duplicate transfer codes");
+    }
+
+    #[test]
+    fn degenerate_primaries_and_invalid_luminance_never_emit_nan() {
+        let zero_y = Primaries {
+            red: (0.64, 0.0),
+            green: (0.30, 0.60),
+            blue: (0.15, 0.06),
+            white: D65,
+        };
+        let converted = zero_y.convert_to(&Primaries::SRGB);
+        for row in converted {
+            for cell in row {
+                assert!(cell.is_finite(), "non-finite matrix entry in {converted:?}");
+            }
+        }
+
+        let nan_matrix = [[f32::NAN; 3]; 3];
+        assert!(invert(&nan_matrix).is_none());
+
+        let bad_ref = Description {
+            reference_luminance: 0.0,
+            ..Description::default()
+        };
+        let nan_ref = Description {
+            reference_luminance: f32::NAN,
+            ..Description::default()
+        };
+        let ok = Description::default();
+        assert!(luminance_scale(&bad_ref, &ok).is_finite());
+        assert!(luminance_scale(&ok, &bad_ref).is_finite());
+        assert!(luminance_scale(&nan_ref, &ok).is_finite());
+        assert!(tonemap_ratio(&bad_ref, &ok).is_finite());
+        assert!(tonemap_ratio(&ok, &bad_ref).is_finite());
     }
 }
