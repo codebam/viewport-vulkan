@@ -1547,9 +1547,19 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 "a frame cannot be captured onto itself".to_owned(),
             ));
         }
+        if !source.is_readable() {
+            return Err(Error::Unsupported(
+                "the framebuffer's modifier does not support being copied from".to_owned(),
+            ));
+        }
         if !to.is_writable() {
             return Err(Error::Unsupported(
                 "the capture target's modifier does not support being written".to_owned(),
+            ));
+        }
+        if !to.is_sampleable() {
+            return Err(Error::Unsupported(
+                "the capture target's modifier does not support being sampled".to_owned(),
             ));
         }
 
@@ -1563,23 +1573,44 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             vk::AccessFlags::TRANSFER_READ,
         );
-        let to_dst = to.transition(
-            vk::ImageLayout::GENERAL,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-        );
+        // Acquire a newly imported capture target from the foreign queue; if
+        // this scratch buffer was already sampled by an earlier blur in this
+        // frame, synchronize against prior fragment shader reads before writing.
+        let to_dst = if to.take_foreign() {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(self.renderer.device.queue_family())
+                .image(to.handle())
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+        } else {
+            to.transition(
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+                vk::AccessFlags::TRANSFER_WRITE,
+            )
+        };
         let restore_src = source.transition(
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::AccessFlags::TRANSFER_READ,
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         );
         let restore_dst = to.transition(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::GENERAL,
             vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::empty(),
+            vk::AccessFlags::SHADER_READ,
         );
 
         let layers = vk::ImageSubresourceLayers {
@@ -1623,7 +1654,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         unsafe {
             handle.cmd_pipeline_barrier(
                 buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1642,7 +1674,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             handle.cmd_pipeline_barrier(
                 buffer,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -3127,6 +3160,10 @@ mod tests {
                 TextureFilter::Linear,
             )
             .expect("capture");
+        assert!(
+            image.is_sampleable(),
+            "a blur capture target must carry SAMPLED image usage"
+        );
         frame
             .draw_background_blur(
                 &image,

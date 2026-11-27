@@ -170,6 +170,11 @@ impl Image {
         // the whole image. Claiming the usage would make those calls compile,
         // pass, and copy a third of the picture.
         let mut usage = purpose.usage();
+        if purpose == Purpose::Render && support.sampling && !yuv {
+            // Render targets used as background-blur scratch buffers are
+            // blitted into and then sampled back through a COMBINED_IMAGE_SAMPLER.
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
         if support.transfer_src && !yuv {
             usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
@@ -491,6 +496,11 @@ impl Image {
         self.purpose
     }
 
+    /// Whether this image can be sampled by a shader.
+    pub fn is_sampleable(&self) -> bool {
+        self.usage.contains(vk::ImageUsageFlags::SAMPLED)
+    }
+
     /// Whether this image can be the source of a copy — that is, whether it
     /// can be read back into memory at all.
     pub fn is_readable(&self) -> bool {
@@ -500,6 +510,13 @@ impl Image {
     /// Whether this image can be the destination of a copy or a blit.
     pub fn is_writable(&self) -> bool {
         self.usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
+    }
+
+    /// Claim ownership from `VK_QUEUE_FAMILY_FOREIGN_EXT` if this image is
+    /// currently foreign, returning whether an ownership transfer is needed.
+    pub(crate) fn take_foreign(&self) -> bool {
+        self.foreign
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A barrier handing the image back to whoever will consume it next.
