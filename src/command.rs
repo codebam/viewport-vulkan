@@ -216,9 +216,12 @@ impl Commands {
             if signal {
                 submit = submit.signal_semaphores(&signals);
             }
-            handle
-                .queue_submit(self.device.queue(), &[submit], self.fence)
-                .context("vkQueueSubmit")?;
+            if let Err(e) = handle.queue_submit(self.device.queue(), &[submit], self.fence) {
+                for semaphore in self.waits.drain(..) {
+                    handle.destroy_semaphore(semaphore, None);
+                }
+                return Err(anyhow::Error::from(e).context("vkQueueSubmit"));
+            }
         }
         // Held until the submission completes; destroying a semaphore the
         // queue is still waiting on is a use-after-free inside the driver.

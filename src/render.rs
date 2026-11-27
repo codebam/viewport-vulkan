@@ -72,6 +72,12 @@ impl<'a> Frame<'a> {
             target.purpose() == Purpose::Render,
             "{target:?} was imported for sampling, not rendering"
         );
+        for source in sources {
+            anyhow::ensure!(
+                source.purpose() == Purpose::Sample,
+                "{source:?} was imported for rendering, not sampling"
+            );
+        }
 
         let buffer = commands.begin()?;
         let handle = device.handle();
@@ -81,10 +87,6 @@ impl<'a> Frame<'a> {
         let mut barriers = Vec::with_capacity(sources.len() + 1);
         barriers.push(target.acquire_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL));
         for source in sources {
-            anyhow::ensure!(
-                source.purpose() == Purpose::Sample,
-                "{source:?} was imported for rendering, not sampling"
-            );
             barriers.push(source.acquire_barrier(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
         }
 

@@ -96,8 +96,8 @@ impl Push {
         // second copy of the rule: the shader and `Description::convert` are
         // checked against each other, and they can only disagree once.
         self.misc[3] = crate::color::luminance_scale(from, to);
-        self.csc0 = [matrix[0][0], matrix[0][1], matrix[0][2], 0.0];
-        self.csc1 = [matrix[1][0], matrix[1][1], matrix[1][2], 0.0];
+        self.csc0 = [matrix[0][0], matrix[0][1], matrix[0][2], self.csc0[3]];
+        self.csc1 = [matrix[1][0], matrix[1][1], matrix[1][2], self.csc1[3]];
         // The spare `w` of csc2 is how much the source's range has to be
         // squeezed into the target's — one when nothing has to move.
         self.csc2 = [
@@ -715,5 +715,25 @@ mod tests {
             let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             assert_eq!(magic, 0x0723_0203, "{name} is not SPIR-V");
         }
+    }
+
+    #[test]
+    fn with_color_preserves_opaque_and_tonemap_flags() {
+        let id = crate::transform::Affine {
+            a: [1.0, 0.0, 0.0, 1.0],
+            b: [0.0, 0.0, 0.0, 0.0],
+        };
+        let push = Push::new(id, id, [1.0; 4], 1.0)
+            .with_opaque(true)
+            .with_tonemap(crate::color::TonemapMode::Limited)
+            .with_color(
+                &crate::color::Description::default(),
+                &crate::color::Description::default(),
+            );
+        assert_eq!(push.csc0[3], 1.0);
+        assert_eq!(
+            push.csc1[3],
+            crate::color::TonemapMode::Limited.as_code() as f32
+        );
     }
 }
