@@ -241,114 +241,150 @@ impl Pipelines {
             unsafe { handle.create_shader_module(&info, None) }.context("vkCreateShaderModule")
         };
 
-        let vertex = module(QUAD_VERT)?;
-        let solid = module(SOLID_FRAG)?;
-        let texture = module(TEXTURE_FRAG)?;
-        let blur = module(BLUR_FRAG)?;
-        let solid_lut = module(SOLID_LUT_FRAG)?;
-        let texture_lut = module(TEXTURE_LUT_FRAG)?;
-        let blur_lut = module(BLUR_LUT_FRAG)?;
+        let mut shaders: Vec<vk::ShaderModule> = Vec::with_capacity(7);
+        let mut samplers: Vec<vk::Sampler> = Vec::with_capacity(2);
+        let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::with_capacity(2);
+        let mut pipeline_layouts: Vec<vk::PipelineLayout> = Vec::with_capacity(2);
 
-        // Linear filtering because surfaces get scaled — the overview draws
-        // every window shrunk. CLAMP_TO_EDGE so sampling at the very edge of a
-        // scaled surface does not wrap round to the opposite side.
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let sampler =
-            unsafe { handle.create_sampler(&sampler_info, None) }.context("vkCreateSampler")?;
+        let build = (|| -> Result<Self> {
+            let mut make_module = |bytes: &[u8]| -> Result<vk::ShaderModule> {
+                let m = module(bytes)?;
+                shaders.push(m);
+                Ok(m)
+            };
+            let vertex = make_module(QUAD_VERT)?;
+            let solid = make_module(SOLID_FRAG)?;
+            let texture = make_module(TEXTURE_FRAG)?;
+            let blur = make_module(BLUR_FRAG)?;
+            let solid_lut = make_module(SOLID_LUT_FRAG)?;
+            let texture_lut = make_module(TEXTURE_LUT_FRAG)?;
+            let blur_lut = make_module(BLUR_LUT_FRAG)?;
 
-        let binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
-        let bindings = [binding];
-        // PUSH_DESCRIPTOR: the surface texture is pushed straight into the
-        // command buffer, so there is no descriptor pool to size, allocate
-        // from, or recycle across frames.
-        let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-            .bindings(&bindings);
-        let set_layout = unsafe { handle.create_descriptor_set_layout(&set_layout_info, None) }
-            .context("vkCreateDescriptorSetLayout")?;
+            // Linear filtering because surfaces get scaled — the overview draws
+            // every window shrunk. CLAMP_TO_EDGE so sampling at the very edge of a
+            // scaled surface does not wrap round to the opposite side.
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            let sampler =
+                unsafe { handle.create_sampler(&sampler_info, None) }.context("vkCreateSampler")?;
+            samplers.push(sampler);
 
-        // The cube's sampler: linear, because a cube is a lookup table and the
-        // interpolation between its samples is the point of it; clamped, so a
-        // coordinate at a face samples that face rather than wrapping.
-        let lut_sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let lut_sampler = unsafe { handle.create_sampler(&lut_sampler_info, None) }
-            .context("vkCreateSampler for the colour cube")?;
-
-        // Two bindings: the surface as before, and the cube. The cube is
-        // pushed like the surface is, so a renderer can swap one output's cube
-        // for another's without recreating anything.
-        let bindings = [
-            vk::DescriptorSetLayoutBinding::default()
+            let binding = vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        ];
-        let lut_set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
-            .bindings(&bindings);
-        let lut_set_layout =
-            unsafe { handle.create_descriptor_set_layout(&lut_set_layout_info, None) }
-                .context("vkCreateDescriptorSetLayout for the colour cube")?;
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+            let bindings = [binding];
+            // PUSH_DESCRIPTOR: the surface texture is pushed straight into the
+            // command buffer, so there is no descriptor pool to size, allocate
+            // from, or recycle across frames.
+            let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                .bindings(&bindings);
+            let set_layout = unsafe { handle.create_descriptor_set_layout(&set_layout_info, None) }
+                .context("vkCreateDescriptorSetLayout")?;
+            set_layouts.push(set_layout);
 
-        let push_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(std::mem::size_of::<Push>() as u32);
-        let set_layouts = [set_layout];
-        let ranges = [push_range];
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&ranges);
-        let layout = unsafe { handle.create_pipeline_layout(&layout_info, None) }
-            .context("vkCreatePipelineLayout")?;
-        let lut_set_layouts = [lut_set_layout];
-        let lut_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&lut_set_layouts)
-            .push_constant_ranges(&ranges);
-        let lut_layout = unsafe { handle.create_pipeline_layout(&lut_layout_info, None) }
-            .context("vkCreatePipelineLayout for the colour cube")?;
+            // The cube's sampler: linear, because a cube is a lookup table and the
+            // interpolation between its samples is the point of it; clamped, so a
+            // coordinate at a face samples that face rather than wrapping.
+            let lut_sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            let lut_sampler = unsafe { handle.create_sampler(&lut_sampler_info, None) }
+                .context("vkCreateSampler for the colour cube")?;
+            samplers.push(lut_sampler);
 
-        Ok(Self {
-            device: device.clone(),
-            vertex,
-            solid,
-            texture,
-            blur,
-            solid_lut,
-            texture_lut,
-            blur_lut,
-            sampler,
-            set_layout,
-            layout,
-            lut_sampler,
-            lut_set_layout,
-            lut_layout,
-            by_format: HashMap::new(),
-            lut_by_format: HashMap::new(),
-            ycbcr: HashMap::new(),
-        })
+            // Two bindings: the surface as before, and the cube. The cube is
+            // pushed like the surface is, so a renderer can swap one output's cube
+            // for another's without recreating anything.
+            let bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            ];
+            let lut_set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+                .bindings(&bindings);
+            let lut_set_layout =
+                unsafe { handle.create_descriptor_set_layout(&lut_set_layout_info, None) }
+                    .context("vkCreateDescriptorSetLayout for the colour cube")?;
+            set_layouts.push(lut_set_layout);
+
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(std::mem::size_of::<Push>() as u32);
+            let plain_sets = [set_layout];
+            let ranges = [push_range];
+            let layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&plain_sets)
+                .push_constant_ranges(&ranges);
+            let layout = unsafe { handle.create_pipeline_layout(&layout_info, None) }
+                .context("vkCreatePipelineLayout")?;
+            pipeline_layouts.push(layout);
+            let lut_sets = [lut_set_layout];
+            let lut_layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&lut_sets)
+                .push_constant_ranges(&ranges);
+            let lut_layout = unsafe { handle.create_pipeline_layout(&lut_layout_info, None) }
+                .context("vkCreatePipelineLayout for the colour cube")?;
+            pipeline_layouts.push(lut_layout);
+
+            Ok(Self {
+                device: device.clone(),
+                vertex,
+                solid,
+                texture,
+                blur,
+                solid_lut,
+                texture_lut,
+                blur_lut,
+                sampler,
+                set_layout,
+                layout,
+                lut_sampler,
+                lut_set_layout,
+                lut_layout,
+                by_format: HashMap::new(),
+                lut_by_format: HashMap::new(),
+                ycbcr: HashMap::new(),
+            })
+        })();
+
+        if build.is_err() {
+            unsafe {
+                for l in pipeline_layouts {
+                    handle.destroy_pipeline_layout(l, None);
+                }
+                for l in set_layouts {
+                    handle.destroy_descriptor_set_layout(l, None);
+                }
+                for s in samplers {
+                    handle.destroy_sampler(s, None);
+                }
+                for m in shaders {
+                    handle.destroy_shader_module(m, None);
+                }
+            }
+        }
+        build
     }
 
     pub fn layout(&self) -> vk::PipelineLayout {
@@ -668,6 +704,9 @@ mod tests {
             ("solid.frag", SOLID_FRAG),
             ("texture.frag", TEXTURE_FRAG),
             ("blur.frag", BLUR_FRAG),
+            ("solid.lut.frag", SOLID_LUT_FRAG),
+            ("texture.lut.frag", TEXTURE_LUT_FRAG),
+            ("blur.lut.frag", BLUR_LUT_FRAG),
         ] {
             assert!(
                 bytes.len() % 4 == 0,
