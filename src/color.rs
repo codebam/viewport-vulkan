@@ -313,18 +313,17 @@ impl TonemapMode {
 
     /// What one colour becomes once the source range has been squeezed into
     /// the target's. `ratio` is [`tonemap_ratio`], and `rgb` is light in the
-    /// target's units — so a source peak of 1.0 against a ratio of 0.2 arrives
-    /// here as 0.2.
+    /// target's units — so 1.0 is the target's peak, mid-tones sit below the
+    /// knee, and HDR highlights sit above 1.0.
     pub fn apply(self, ratio: f32, rgb: [f32; 3]) -> [f32; 3] {
         if self == Self::Off || ratio >= 1.0 {
             return rgb;
         }
-        let scaled = rgb.map(|value| value * ratio);
         if self == Self::Clamp {
-            return scaled;
+            return rgb.map(|value| value * ratio);
         }
         let knee = self.knee();
-        scaled.map(|value| {
+        rgb.map(|value| {
             if value <= knee {
                 value
             } else {
@@ -651,25 +650,26 @@ mod tests {
     #[test]
     fn tone_mapping_keeps_the_mid_tones_and_folds_the_highlights() {
         // HDR content on an SDR screen: 203 cd/m² of headroom against a
-        // source that can carry 10,000.
+        // source that can carry 10,000. `rgb` is already in target units (after
+        // `luminance_scale`), so 0.5 is 101.5 nits and 1.2 is 243.6 nits.
         let ratio = 0.0203;
         // Everything under the knee is untouched: a mid-tone keeps its slope.
-        let mid = TonemapMode::On.apply(ratio, [0.5 / ratio; 3])[0];
+        let mid = TonemapMode::On.apply(ratio, [0.5; 3])[0];
         assert!((mid - 0.5).abs() < 1e-4, "{mid}");
-        // A value that lands just over one in target units is folded back into
-        // the range rather than clipped away.
-        let highlight = TonemapMode::On.apply(ratio, [1.2 / ratio; 3])[0];
+        // A highlight over 1.0 in target units is folded back into (knee, 1.0)
+        // rather than clipped away.
+        let highlight = TonemapMode::On.apply(ratio, [1.2; 3])[0];
         assert!(highlight > 0.8, "{highlight}");
         assert!(highlight < 1.0, "{highlight}");
-        // Clamp is the plain scale, which the encode then clips.
-        let clamped = TonemapMode::Clamp.apply(ratio, [1.2 / ratio; 3])[0];
-        assert!((clamped - 1.2).abs() < 1e-4, "{clamped}");
+        // Clamp scales the source peak (1.0 / ratio) onto 1.0.
+        let clamped_peak = TonemapMode::Clamp.apply(ratio, [1.0 / ratio; 3])[0];
+        assert!((clamped_peak - 1.0).abs() < 1e-4, "{clamped_peak}");
         // Limited starts folding lower: a value between the two knees moves
         // where On leaves it alone, and the same highlight folds further.
-        let between = 0.7 / ratio;
+        let between = 0.7;
         assert!((TonemapMode::On.apply(ratio, [between; 3])[0] - 0.7).abs() < 1e-4);
         assert!(TonemapMode::Limited.apply(ratio, [between; 3])[0] < 0.7);
-        assert!(TonemapMode::Limited.apply(ratio, [1.2 / ratio; 3])[0] < highlight);
+        assert!(TonemapMode::Limited.apply(ratio, [1.2; 3])[0] < highlight);
     }
 
     #[test]

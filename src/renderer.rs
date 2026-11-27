@@ -3597,6 +3597,30 @@ mod tests {
     }
 
     #[test]
+    fn tonemap_on_preserves_hdr_midtones_on_an_sdr_output() {
+        use crate::color::{Description, Primaries, TransferFunction};
+
+        let Some(mut h) = harness() else { return };
+        let hdr = Description {
+            transfer: TransferFunction::Pq,
+            primaries: Primaries::BT2020,
+            reference_luminance: 203.0,
+        };
+        let sdr = Description::default();
+        // ~100 cd/m² in PQ is encoded near 0.508 (byte 130). In SDR target
+        // units (203 nits = 1.0), that is ~0.493 linear -> ~0.732 sRGB (~187/255).
+        // Multiplying by tonemap_ratio before the knee crushed it to ~26/255.
+        let pq_100nit = (TransferFunction::Pq.from_linear(100.0 / 10_000.0) * 255.0).round() as u8;
+        let got = convert_and_read(&mut h, hdr, sdr, pq_100nit);
+        let expected_srgb = TransferFunction::Srgb.from_linear(100.0 / 203.0);
+        let want = (expected_srgb * 255.0).round() as i32;
+        assert!(
+            (got[0] as i32 - want).abs() <= 4,
+            "100-nit PQ mid-tone on SDR should land near {want}, got {got:?}"
+        );
+    }
+
+    #[test]
     fn a_texture_defaults_to_sdr_srgb() {
         // What a client that says nothing is assumed to have sent.
         let Some(mut h) = harness() else { return };

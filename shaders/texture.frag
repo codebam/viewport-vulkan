@@ -127,12 +127,12 @@ vec3 from_linear(vec3 v, uint transfer) {
 
 // Tone mapping: fold the headroom a dimmer output cannot show. The reference
 // this is checked against is `TonemapMode::apply` in color.rs, and the mode
-// codes are theirs. `clamp` (2) is the plain scale, which the encode clips
-// afterwards; `on` (1) and `limited` (3) fold everything above a knee into the
-// range that is left, so the desktop's mid-tones keep their slope.
-vec3 tonemap_curve(vec3 x, uint mode) {
+// codes are theirs. `clamp` (2) scales the source peak onto the target's;
+// `on` (1) and `limited` (3) fold everything above a knee (in target units)
+// into the range that is left, so mid-tones keep their slope.
+vec3 tonemap_curve(vec3 x, float ratio, uint mode) {
     if (mode == 2u) {
-        return x;
+        return x * ratio;
     }
     float knee = mode == 3u ? 0.6 : 0.8;
     float headroom = 1.0 - knee;
@@ -174,7 +174,7 @@ void main() {
     // above one, is the ordinary path — every SDR window on an SDR screen.
     uint tonemap = uint(push.csc1.w + 0.5);
     if (tonemap != 0u && push.csc2.w < 1.0) {
-        linear = tonemap_curve(linear * push.csc2.w, tonemap);
+        linear = tonemap_curve(linear, push.csc2.w, tonemap);
     }
 
     // Out-of-gamut values are real: a saturated BT.2020 red has no sRGB
