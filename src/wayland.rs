@@ -76,7 +76,7 @@ fn described(
 /// Repack `src` into tightly packed rows.
 ///
 /// A client's shm buffer has whatever stride it chose — often padded for
-/// alignment — while the upload path wants `width * 4` per row. Returning a
+/// alignment — while the upload path wants `width * bpp` per row. Returning a
 /// borrow in the common case where they already agree keeps the copy out of
 /// the path most clients take.
 pub(crate) fn repack(
@@ -85,11 +85,23 @@ pub(crate) fn repack(
     stride: usize,
     width: usize,
     height: usize,
+    bpp: usize,
 ) -> Result<std::borrow::Cow<'_, [u8]>, Error> {
-    let packed = width * 4;
-    let needed = offset
-        .checked_add(stride.saturating_mul(height.saturating_sub(1)))
+    if width == 0 || height == 0 || bpp == 0 {
+        return Err(Error::Unsupported("a zero-sized shm buffer".to_owned()));
+    }
+    let packed = width
+        .checked_mul(bpp)
+        .ok_or_else(|| Error::Unsupported("shm buffer dimensions overflow".to_owned()))?;
+    if stride < packed {
+        return Err(Error::Unsupported(format!(
+            "shm stride {stride} is narrower than a {packed}-byte row"
+        )));
+    }
+    let needed = stride
+        .checked_mul(height - 1)
         .and_then(|v| v.checked_add(packed))
+        .and_then(|v| offset.checked_add(v))
         .ok_or_else(|| Error::Unsupported("shm buffer dimensions overflow".to_owned()))?;
     if src.len() < needed {
         return Err(Error::Unsupported(format!(
@@ -98,11 +110,14 @@ pub(crate) fn repack(
         )));
     }
 
+    let total = packed
+        .checked_mul(height)
+        .ok_or_else(|| Error::Unsupported("shm buffer dimensions overflow".to_owned()))?;
     if stride == packed && offset == 0 {
-        return Ok(std::borrow::Cow::Borrowed(&src[..packed * height]));
+        return Ok(std::borrow::Cow::Borrowed(&src[..total]));
     }
 
-    let mut out = Vec::with_capacity(packed * height);
+    let mut out = Vec::with_capacity(total);
     for row in 0..height {
         let start = offset + row * stride;
         out.extend_from_slice(&src[start..start + packed]);
@@ -124,21 +139,26 @@ impl ImportMemWl for VulkanRenderer {
                 smithay::wayland::shm::shm_format_to_fourcc(data.format).ok_or_else(|| {
                     Error::Unsupported(format!("no fourcc for shm format {:?}", data.format))
                 })?;
+            let bpp = crate::format::bytes_per_pixel(fourcc)
+                .ok_or_else(|| Error::Unsupported(format!("unsupported shm format {fourcc:?}")))?;
 
-            let (width, height) = (data.width.max(0) as usize, data.height.max(0) as usize);
-            if width == 0 || height == 0 {
-                return Err(Error::Unsupported("a zero-sized shm buffer".to_owned()));
+            if data.width <= 0 || data.height <= 0 || data.offset < 0 || data.stride < 0 {
+                return Err(Error::Unsupported(
+                    "invalid shm buffer dimensions".to_owned(),
+                ));
             }
+            let (width, height) = (data.width as usize, data.height as usize);
 
             // SAFETY: with_buffer_contents guarantees the mapping is valid and
             // the pool is locked for the duration of this closure.
             let bytes = unsafe { std::slice::from_raw_parts(pointer, len) };
             let packed = repack(
                 bytes,
-                data.offset.max(0) as usize,
-                data.stride.max(0) as usize,
+                data.offset as usize,
+                data.stride as usize,
                 width,
                 height,
+                bpp,
             )?;
 
             Ok((fourcc, width as i32, height as i32, packed.into_owned()))
@@ -301,7 +321,7 @@ mod tests {
     fn a_tightly_packed_buffer_is_not_copied() {
         // 2x2, stride exactly the row length.
         let src: Vec<u8> = (0..16).collect();
-        let out = repack(&src, 0, 8, 2, 2).expect("repack");
+        let out = repack(&src, 0, 8, 2, 2, 4).expect("repack");
         assert!(
             matches!(out, std::borrow::Cow::Borrowed(_)),
             "needlessly copied"
@@ -318,7 +338,7 @@ mod tests {
         src.extend_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
         src.extend_from_slice(&[0, 0, 0, 0]);
 
-        let out = repack(&src, 0, 12, 2, 2).expect("repack");
+        let out = repack(&src, 0, 12, 2, 2, 4).expect("repack");
         assert!(
             matches!(out, std::borrow::Cow::Owned(_)),
             "should have copied"
@@ -333,7 +353,7 @@ mod tests {
     fn an_offset_is_honoured() {
         let mut src = vec![0xff; 4];
         src.extend_from_slice(&[1, 2, 3, 4]);
-        let out = repack(&src, 4, 4, 1, 1).expect("repack");
+        let out = repack(&src, 4, 4, 1, 1, 4).expect("repack");
         assert_eq!(&*out, &[1, 2, 3, 4]);
     }
 
@@ -341,17 +361,35 @@ mod tests {
     fn a_short_buffer_is_an_error_rather_than_a_read_past_the_end() {
         // The last row is missing.
         let src = vec![0u8; 8];
-        let error = repack(&src, 0, 8, 2, 2).expect_err("a short buffer must be refused");
+        let error = repack(&src, 0, 8, 2, 2, 4).expect_err("a short buffer must be refused");
         assert!(error.to_string().contains("needs"), "{error}");
     }
 
     #[test]
     fn absurd_dimensions_do_not_overflow() {
         let src = vec![0u8; 16];
-        let error = repack(&src, 0, usize::MAX, 2, 2).expect_err("must not overflow");
+        let error = repack(&src, 0, usize::MAX, 2, 2, 4).expect_err("must not overflow");
         assert!(
             error.to_string().contains("overflow") || error.to_string().contains("needs"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn non_32bpp_formats_and_narrow_strides_are_handled_by_bpp() {
+        // 2x2 half-float (8 bytes/pixel) with 4 bytes of row padding: stride 20.
+        let mut src = Vec::new();
+        src.extend_from_slice(&[1u8; 16]);
+        src.extend_from_slice(&[0u8; 4]);
+        src.extend_from_slice(&[2u8; 16]);
+        src.extend_from_slice(&[0u8; 4]);
+        let out = repack(&src, 0, 20, 2, 2, 8).expect("8bpp repack");
+        assert_eq!(out.len(), 32);
+        assert_eq!(&out[..16], &[1u8; 16]);
+        assert_eq!(&out[16..], &[2u8; 16]);
+
+        // Stride narrower than one row must be rejected instead of overlapping rows.
+        let err = repack(&src, 0, 4, 2, 2, 4).expect_err("narrow stride");
+        assert!(err.to_string().contains("narrower"), "{err}");
     }
 }

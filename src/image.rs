@@ -355,6 +355,10 @@ impl Image {
         height: u32,
         fourcc: smithay::backend::allocator::Fourcc,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            !format::is_yuv(fourcc),
+            "multi-planar {fourcc:?} cannot be allocated as a single-plane image"
+        );
         let vk_format =
             format::to_vulkan(fourcc).ok_or_else(|| anyhow!("no Vulkan format for {fourcc:?}"))?;
         let handle = device.handle();

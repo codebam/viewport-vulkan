@@ -649,12 +649,29 @@ impl VulkanRenderer {
         from_layout: vk::ImageLayout,
     ) -> Result<(), Error> {
         let image = &texture.image;
-        let (x, y) = (region.loc.x.max(0), region.loc.y.max(0));
+        let bpp = format::bytes_per_pixel(image.fourcc()).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{:?} does not have a linear per-pixel upload layout",
+                image.fourcc()
+            ))
+        })?;
+        if region.loc.x < 0 || region.loc.y < 0 {
+            return Err(Error::Unsupported(format!(
+                "region {region:?} has a negative origin"
+            )));
+        }
+        let (x, y) = (region.loc.x, region.loc.y);
         let (w, h) = (region.size.w.max(0) as u32, region.size.h.max(0) as u32);
         if w == 0 || h == 0 {
             return Err(Error::Unsupported("an empty upload region".to_owned()));
         }
-        if x as u32 + w > image.width() || y as u32 + h > image.height() {
+        let end_x = (x as u32)
+            .checked_add(w)
+            .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
+        let end_y = (y as u32)
+            .checked_add(h)
+            .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
+        if end_x > image.width() || end_y > image.height() {
             return Err(Error::Unsupported(format!(
                 "region {region:?} is outside the {}x{} texture",
                 image.width(),
@@ -662,9 +679,12 @@ impl VulkanRenderer {
             )));
         }
 
-        // Four bytes per pixel: every format in `mem_formats` is 32bpp.
-        let stride = image.width() as usize * 4;
-        let needed = stride * image.height() as usize;
+        let stride = (image.width() as usize)
+            .checked_mul(bpp)
+            .ok_or_else(|| Error::Unsupported("texture stride overflows".to_owned()))?;
+        let needed = stride
+            .checked_mul(image.height() as usize)
+            .ok_or_else(|| Error::Unsupported("texture size overflows".to_owned()))?;
         if data.len() < needed {
             // The trait says too small is an error and beyond is truncated.
             return Err(Error::Unsupported(format!(
@@ -674,6 +694,14 @@ impl VulkanRenderer {
                 image.height()
             )));
         }
+        let buffer_offset = (y as usize)
+            .checked_mul(stride)
+            .and_then(|row| {
+                (x as usize)
+                    .checked_mul(bpp)
+                    .and_then(|col| row.checked_add(col))
+            })
+            .ok_or_else(|| Error::Unsupported("upload buffer offset overflows".to_owned()))?;
 
         // The whole buffer is staged even for a partial update, so the copy
         // can use the source stride directly instead of packing rows.
@@ -698,7 +726,7 @@ impl VulkanRenderer {
 
         let copy = vk::BufferImageCopy::default()
             // Where the region starts within the staged buffer.
-            .buffer_offset((y as usize * stride + x as usize * 4) as vk::DeviceSize)
+            .buffer_offset(buffer_offset as vk::DeviceSize)
             // In pixels, not bytes: this is how a partial update reads the
             // right rows out of a full-size source.
             .buffer_row_length(image.width())
@@ -867,12 +895,29 @@ impl VulkanRenderer {
             )));
         }
 
-        let (x, y) = (region.loc.x.max(0), region.loc.y.max(0));
+        let bpp = format::bytes_per_pixel(image.fourcc()).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{:?} does not have a linear per-pixel download layout",
+                image.fourcc()
+            ))
+        })?;
+        if region.loc.x < 0 || region.loc.y < 0 {
+            return Err(Error::Unsupported(format!(
+                "region {region:?} has a negative origin"
+            )));
+        }
+        let (x, y) = (region.loc.x, region.loc.y);
         let (w, h) = (region.size.w.max(0) as u32, region.size.h.max(0) as u32);
         if w == 0 || h == 0 {
             return Err(Error::Unsupported("an empty copy region".to_owned()));
         }
-        if x as u32 + w > image.width() || y as u32 + h > image.height() {
+        let end_x = (x as u32)
+            .checked_add(w)
+            .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
+        let end_y = (y as u32)
+            .checked_add(h)
+            .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
+        if end_x > image.width() || end_y > image.height() {
             return Err(Error::Unsupported(format!(
                 "region {region:?} is outside the {}x{} image",
                 image.width(),
@@ -880,9 +925,12 @@ impl VulkanRenderer {
             )));
         }
 
-        // Tightly packed: the mapping's stride is its width, which is what
+        // Tightly packed: the mapping's stride is `width * bpp`, which is what
         // `map_texture`'s caller assumes.
-        let len = (w as usize) * (h as usize) * 4;
+        let len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|pixels| pixels.checked_mul(bpp))
+            .ok_or_else(|| Error::Unsupported("copy region size overflows".to_owned()))?;
         let buffer = crate::staging::Staging::new(&self.device, len as vk::DeviceSize)?;
 
         let command = self.commands.begin()?;

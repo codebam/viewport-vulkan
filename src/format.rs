@@ -114,6 +114,28 @@ pub fn has_alpha(fourcc: Fourcc) -> bool {
     )
 }
 
+/// Bytes per pixel for a single-plane format this renderer can upload or read
+/// back linearly.
+///
+/// Multi-planar YUV formats have no single per-pixel byte width and return
+/// `None`.
+pub fn bytes_per_pixel(fourcc: Fourcc) -> Option<usize> {
+    Some(match fourcc {
+        Fourcc::R8 => 1,
+        Fourcc::Rgb565 | Fourcc::Gr88 => 2,
+        Fourcc::Argb8888
+        | Fourcc::Xrgb8888
+        | Fourcc::Abgr8888
+        | Fourcc::Xbgr8888
+        | Fourcc::Abgr2101010
+        | Fourcc::Xbgr2101010
+        | Fourcc::Argb2101010
+        | Fourcc::Xrgb2101010 => 4,
+        Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => 8,
+        _ => return None,
+    })
+}
+
 /// What a format can be used for on this device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModifierSupport {
@@ -366,9 +388,26 @@ mod tests {
         for code in COMMON_FORMATS.iter().copied().filter(|&c| is_yuv(c)) {
             assert!(!has_alpha(code), "{code:?} must not claim alpha");
             assert!(to_vulkan(code).is_some(), "{code:?} must map");
+            assert_eq!(
+                bytes_per_pixel(code),
+                None,
+                "{code:?} is multi-planar and has no single bytes_per_pixel"
+            );
         }
         assert!(is_yuv(Fourcc::Nv12));
         assert!(!is_yuv(Fourcc::Argb8888));
+    }
+
+    #[test]
+    fn bytes_per_pixel_matches_each_single_plane_format() {
+        assert_eq!(bytes_per_pixel(Fourcc::R8), Some(1));
+        assert_eq!(bytes_per_pixel(Fourcc::Rgb565), Some(2));
+        assert_eq!(bytes_per_pixel(Fourcc::Gr88), Some(2));
+        assert_eq!(bytes_per_pixel(Fourcc::Argb8888), Some(4));
+        assert_eq!(bytes_per_pixel(Fourcc::Abgr2101010), Some(4));
+        assert_eq!(bytes_per_pixel(Fourcc::Abgr16161616f), Some(8));
+        assert_eq!(bytes_per_pixel(Fourcc::Xbgr16161616f), Some(8));
+        assert_eq!(bytes_per_pixel(Fourcc::Yuyv), None);
     }
 
     #[test]
