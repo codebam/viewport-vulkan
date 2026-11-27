@@ -150,66 +150,24 @@ impl ColorLut {
 
     /// Copy the cube into its image and leave it ready to be sampled.
     fn write(&self, data: &[[f32; 4]]) -> Result<()> {
-        let handle = self.device.handle();
-        let bytes = data.len() * SAMPLE_BYTES;
-        let staging = unsafe {
-            handle.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bytes as u64)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
+        let bytes = data
+            .len()
+            .checked_mul(SAMPLE_BYTES)
+            .ok_or_else(|| anyhow!("cube staging size overflows"))?;
+        let mut staging = crate::staging::Staging::new(&self.device, bytes as vk::DeviceSize)?;
+        let mut half = Vec::with_capacity(bytes);
+        for sample in data {
+            for channel in sample {
+                half.extend_from_slice(&to_half(*channel).to_ne_bytes());
+            }
         }
-        .context("vkCreateBuffer")?;
-        let requirements = unsafe { handle.get_buffer_memory_requirements(staging) };
-        let memory_type = self
-            .device
-            .memory_type_with(requirements.memory_type_bits, |flags| {
-                flags.contains(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
-            })
-            .ok_or_else(|| anyhow!("no host-visible memory type"))?;
-        let allocate = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let staging_memory = unsafe { handle.allocate_memory(&allocate, None) }
-            .context("vkAllocateMemory for the cube's staging buffer")?;
-
-        let result = (|| -> Result<()> {
-            unsafe { handle.bind_buffer_memory(staging, staging_memory, 0) }
-                .context("vkBindBufferMemory")?;
-            let pointer = unsafe {
-                handle.map_memory(staging_memory, 0, bytes as u64, vk::MemoryMapFlags::empty())
-            }
-            .context("vkMapMemory")?;
-            let mut half = Vec::with_capacity(bytes);
-            for sample in data {
-                for channel in sample {
-                    half.extend_from_slice(&to_half(*channel).to_ne_bytes());
-                }
-            }
-            // SAFETY: the mapping is `bytes` long and the source is exactly
-            // that many bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(half.as_ptr(), pointer as *mut u8, bytes);
-                handle.unmap_memory(staging_memory);
-            }
-            self.record(&staging);
-            Ok(())
-        })();
-
-        unsafe {
-            handle.destroy_buffer(staging, None);
-            handle.free_memory(staging_memory, None);
-        }
-        result
+        staging.write(0, &half)?;
+        self.record(staging.handle())
     }
 
     /// One command buffer: make the cube copyable, copy into it, and leave it
     /// in the layout the shader samples.
-    fn record(&self, staging: &vk::Buffer) {
+    fn record(&self, staging: vk::Buffer) -> Result<()> {
         let handle = self.device.handle();
         let pool = unsafe {
             handle.create_command_pool(
@@ -219,115 +177,123 @@ impl ColorLut {
                 None,
             )
         }
-        .expect("a transient command pool");
-        let buffer = unsafe {
-            handle.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .expect("a command buffer")[0];
+        .context("vkCreateCommandPool for colour cube upload")?;
 
-        unsafe {
-            handle
-                .begin_command_buffer(
-                    buffer,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        let result = (|| -> Result<()> {
+            let buffer = unsafe {
+                handle.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
                 )
-                .expect("begin a one-shot command buffer");
+            }
+            .context("vkAllocateCommandBuffers for colour cube upload")?[0];
 
-            let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let to_copy = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.image)
-                .subresource_range(range);
-            handle.cmd_pipeline_barrier(
-                buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_copy],
-            );
+            unsafe {
+                handle
+                    .begin_command_buffer(
+                        buffer,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .context("vkBeginCommandBuffer for colour cube upload")?;
 
-            let copy = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
+                let range = vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
+                    base_mip_level: 0,
+                    level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width: self.size,
-                    height: self.size,
-                    depth: self.size,
-                });
-            handle.cmd_copy_buffer_to_image(
-                buffer,
-                *staging,
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
-            );
+                };
+                let to_copy = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.image)
+                    .subresource_range(range);
+                handle.cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_copy],
+                );
 
-            let to_sample = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.image)
-                .subresource_range(range);
-            handle.cmd_pipeline_barrier(
-                buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_sample],
-            );
+                let copy = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width: self.size,
+                        height: self.size,
+                        depth: self.size,
+                    });
+                handle.cmd_copy_buffer_to_image(
+                    buffer,
+                    staging,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy],
+                );
 
-            handle
-                .end_command_buffer(buffer)
-                .expect("end a one-shot command buffer");
+                let to_sample = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.image)
+                    .subresource_range(range);
+                handle.cmd_pipeline_barrier(
+                    buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_sample],
+                );
 
-            let fence = handle
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .expect("a fence");
-            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&buffer));
-            handle
-                .queue_submit(self.device.queue(), &[submit], fence)
-                .expect("upload the cube");
-            handle
-                .wait_for_fences(&[fence], true, u64::MAX)
-                .expect("wait for the cube upload");
-            handle.destroy_fence(fence, None);
-        }
+                handle
+                    .end_command_buffer(buffer)
+                    .context("vkEndCommandBuffer for colour cube upload")?;
+
+                let fence = handle
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .context("vkCreateFence for colour cube upload")?;
+                let submit =
+                    vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&buffer));
+                let submitted = handle
+                    .queue_submit(self.device.queue(), &[submit], fence)
+                    .context("vkQueueSubmit for colour cube upload")
+                    .and_then(|()| {
+                        handle
+                            .wait_for_fences(&[fence], true, u64::MAX)
+                            .context("vkWaitForFences for colour cube upload")
+                    });
+                handle.destroy_fence(fence, None);
+                submitted
+            }
+        })();
 
         unsafe {
             handle.destroy_command_pool(pool, None);
         }
+        result
     }
 }
 
@@ -335,6 +301,8 @@ impl Drop for ColorLut {
     fn drop(&mut self) {
         let handle = self.device.handle();
         unsafe {
+            // An asynchronous frame submission may still be sampling this cube.
+            let _ = handle.device_wait_idle();
             handle.destroy_image_view(self.view, None);
             handle.destroy_image(self.image, None);
             handle.free_memory(self.memory, None);

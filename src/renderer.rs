@@ -297,6 +297,10 @@ impl VulkanRenderer {
         if self.color_lut_token == token {
             return Ok(());
         }
+        if self.color_lut.is_some() {
+            // An earlier frame may still be sampling the old cube.
+            let _ = self.commands.wait(std::time::Duration::from_secs(5));
+        }
         match cube {
             Some((_, data)) => {
                 let side = (data.len().max(1) as f64).cbrt();
