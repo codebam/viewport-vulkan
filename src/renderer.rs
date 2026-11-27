@@ -1235,6 +1235,30 @@ impl smithay::backend::renderer::Blit for VulkanRenderer {
     }
 }
 
+/// Intersect two physical rectangles without overflowing `i32` endpoints,
+/// returning `None` when the intersection is empty.
+fn clip_physical_rect(
+    rect: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    if rect.size.w <= 0 || rect.size.h <= 0 || bounds.size.w <= 0 || bounds.size.h <= 0 {
+        return None;
+    }
+    let x0 = i64::from(rect.loc.x).max(i64::from(bounds.loc.x));
+    let y0 = i64::from(rect.loc.y).max(i64::from(bounds.loc.y));
+    let x1 = (i64::from(rect.loc.x) + i64::from(rect.size.w))
+        .min(i64::from(bounds.loc.x) + i64::from(bounds.size.w));
+    let y1 = (i64::from(rect.loc.y) + i64::from(rect.size.h))
+        .min(i64::from(bounds.loc.y) + i64::from(bounds.size.h));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(Rectangle::new(
+        (x0 as i32, y0 as i32).into(),
+        ((x1 - x0) as i32, (y1 - y0) as i32).into(),
+    ))
+}
+
 /// A frame in progress.
 pub struct VulkanFrame<'frame, 'buffer> {
     renderer: &'frame mut VulkanRenderer,
@@ -1379,13 +1403,21 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // Still desktop space at this point. The scissor is in framebuffer
         // coordinates, and the two differ whenever the transform swaps axes —
         // scissoring a rotated output with its own rectangle leaves most of
-        // the framebuffer untouched.
-        let rects: Vec<Rectangle<i32, Physical>> = clipped
+        // the framebuffer untouched. Intersect with the framebuffer bounds so a
+        // negative-origin damage rectangle is clipped instead of shifted
+        // on-screen when `vk::Rect2D` clamps negative offsets to zero.
+        let target = &self.framebuffer.image;
+        let bounds = Rectangle::from_size(Size::from((
+            target.width().min(i32::MAX as u32) as i32,
+            target.height().min(i32::MAX as u32) as i32,
+        )));
+        clipped
             .into_iter()
-            .map(|rect| crate::transform::framebuffer_rect(rect, self.output_size, self.transform))
-            .collect();
-
-        rects
+            .filter_map(|rect| {
+                let fb = crate::transform::framebuffer_rect(rect, self.output_size, self.transform);
+                clip_physical_rect(fb, bounds)
+            })
+            .collect()
     }
 
     /// Set the one scissor the pipeline has.
@@ -2361,6 +2393,63 @@ mod tests {
                 "x={x} should be the texture's right half, not the clear colour"
             );
         }
+    }
+
+    #[test]
+    fn off_screen_negative_damage_does_not_shift_onto_the_framebuffer() {
+        let Some(mut h) = harness() else { return };
+
+        let source = buffer(&mut h.allocator, 64, 32);
+        fill(&source, [0, 255, 0, 255], 64, 32);
+        let texture = h.renderer.import_dmabuf(&source, None).expect("import");
+
+        let mut target = buffer(&mut h.allocator, 32, 32);
+        let mut framebuffer = h.renderer.bind(&mut target).expect("bind");
+        let mut frame = h
+            .renderer
+            .render(&mut framebuffer, (32, 32).into(), Transform::Normal)
+            .expect("render");
+        frame
+            .clear(
+                Color32F::from([0.0, 0.0, 1.0, 1.0]),
+                &all(frame.output_size().w, frame.output_size().h),
+            )
+            .expect("clear");
+        // Element starts at x = -32, so damage (0..16) relative to dst sits at
+        // x = -32..-16 (entirely off-screen) and damage (0..40) sits at
+        // x = -32..8 (only 0..8 on-screen).
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size(Size::from((64.0, 32.0))),
+                Rectangle::new(Point::from((-32, 0)), Size::from((64, 32))),
+                &[Rectangle::new(Point::from((0, 0)), Size::from((16, 32)))],
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("off-screen damage draw");
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size(Size::from((64.0, 32.0))),
+                Rectangle::new(Point::from((-32, 0)), Size::from((64, 32))),
+                &[Rectangle::new(Point::from((0, 0)), Size::from((40, 32)))],
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("partially on-screen damage draw");
+        let _ = frame.finish().expect("finish");
+        drop(framebuffer);
+
+        // x in [0, 8) was damaged; x >= 8 must keep the blue clear colour (B is byte 0).
+        assert_eq!(pixel(&target, 4, 16), [0, 255, 0, 255], "damaged prefix");
+        assert_eq!(
+            pixel(&target, 12, 16),
+            [255, 0, 0, 255],
+            "undamaged region beyond x=8 must not be overwritten"
+        );
     }
 
     /// The same geometry again, but through the damage tracker the compositor
