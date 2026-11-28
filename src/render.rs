@@ -83,24 +83,42 @@ impl<'a> Frame<'a> {
         let handle = device.handle();
 
         // Claim everything before touching it. Until these run the images
-        // belong to whoever allocated them.
-        let mut barriers = Vec::with_capacity(sources.len() + 1);
-        barriers.push(target.acquire_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL));
-        for source in sources {
-            barriers.push(source.acquire_barrier(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
-        }
-
-        unsafe {
-            handle.cmd_pipeline_barrier(
-                buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barriers,
-            );
+        // belong to whoever allocated them. Wait for prior colour/transfer
+        // stages on the queue so pipelined frames reusing a target stay ordered.
+        let src_stage =
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER;
+        let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | vk::PipelineStageFlags::FRAGMENT_SHADER;
+        let target_barrier = target.acquire_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        if sources.is_empty() {
+            unsafe {
+                handle.cmd_pipeline_barrier(
+                    buffer,
+                    src_stage,
+                    dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[target_barrier],
+                );
+            }
+        } else {
+            let mut barriers = Vec::with_capacity(sources.len() + 1);
+            barriers.push(target_barrier);
+            for source in sources {
+                barriers.push(source.acquire_barrier(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+            }
+            unsafe {
+                handle.cmd_pipeline_barrier(
+                    buffer,
+                    src_stage,
+                    dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+            }
         }
 
         let mut attachment = vk::RenderingAttachmentInfo::default()
