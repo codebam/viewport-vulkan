@@ -24,6 +24,11 @@ pub struct Staging {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     size: vk::DeviceSize,
+    /// Whether `Drop` must call `device_wait_idle()` before destroying the
+    /// buffer. Defaults to `true` for safety; internal callers that have
+    /// already waited on the submission fence can clear this so dropping a
+    /// completed transfer buffer does not stall unrelated in-flight frames.
+    wait_on_drop: bool,
 }
 
 impl Staging {
@@ -88,7 +93,13 @@ impl Staging {
             memory,
             mapped,
             size,
+            wait_on_drop: true,
         })
+    }
+
+    /// Record whether the GPU may still be accessing this buffer when dropped.
+    pub(crate) fn set_wait_on_drop(&mut self, wait: bool) {
+        self.wait_on_drop = wait;
     }
 
     pub fn handle(&self) -> vk::Buffer {
@@ -130,6 +141,66 @@ impl Staging {
         }
         Ok(())
     }
+
+    /// Copy `height` rows of `row_bytes` each from `src` (starting at
+    /// `src_offset` with `src_stride` bytes between rows) tightly packed into
+    /// this staging buffer starting at `dst_offset`.
+    pub fn write_rows_at(
+        &mut self,
+        dst_offset: usize,
+        src: &[u8],
+        src_offset: usize,
+        src_stride: usize,
+        row_bytes: usize,
+        height: usize,
+    ) -> Result<()> {
+        let total = row_bytes
+            .checked_mul(height)
+            .ok_or_else(|| anyhow!("staging row write overflows"))?;
+        let dst_end = dst_offset
+            .checked_add(total)
+            .ok_or_else(|| anyhow!("staging write overflows"))?;
+        anyhow::ensure!(
+            dst_end as vk::DeviceSize <= self.size,
+            "staging write of {total} bytes at {dst_offset} exceeds the {} byte buffer",
+            self.size
+        );
+        if total == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            src_stride >= row_bytes,
+            "source stride {src_stride} is narrower than a {row_bytes}-byte row"
+        );
+        let src_end = src_stride
+            .checked_mul(height - 1)
+            .and_then(|v| v.checked_add(row_bytes))
+            .and_then(|v| src_offset.checked_add(v))
+            .ok_or_else(|| anyhow!("source range overflows"))?;
+        anyhow::ensure!(
+            src_end <= src.len(),
+            "source slice of {} bytes is too short for {height} rows at offset {src_offset} stride {src_stride}",
+            src.len()
+        );
+
+        // SAFETY: both source and destination ranges are bounds-checked above;
+        // the memory is mapped for the lifetime of this struct and coherent.
+        unsafe {
+            let dst_base = self.mapped.add(dst_offset);
+            if src_stride == row_bytes {
+                std::ptr::copy_nonoverlapping(src.as_ptr().add(src_offset), dst_base, total);
+            } else {
+                for row in 0..height {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(src_offset + row * src_stride),
+                        dst_base.add(row * row_bytes),
+                        row_bytes,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Staging {
@@ -142,8 +213,10 @@ impl Drop for Staging {
     fn drop(&mut self) {
         let handle = self.device.handle();
         unsafe {
-            // A copy may still be reading it.
-            let _ = handle.device_wait_idle();
+            if self.wait_on_drop {
+                // A copy may still be reading it.
+                let _ = handle.device_wait_idle();
+            }
             handle.unmap_memory(self.memory);
             handle.destroy_buffer(self.buffer, None);
             handle.free_memory(self.memory, None);

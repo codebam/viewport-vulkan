@@ -11,7 +11,7 @@
 // Behind the `wayland` feature so the renderer stays usable — and testable —
 // without a Wayland display.
 
-use smithay::backend::renderer::{ImportDmaWl, ImportMem, ImportMemWl, Texture as _};
+use smithay::backend::renderer::{ImportDmaWl, ImportMemWl, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Buffer as BufferCoord, Rectangle};
@@ -73,20 +73,16 @@ fn described(
     }
 }
 
-/// Repack `src` into tightly packed rows.
-///
-/// A client's shm buffer has whatever stride it chose — often padded for
-/// alignment — while the upload path wants `width * bpp` per row. Returning a
-/// borrow in the common case where they already agree keeps the copy out of
-/// the path most clients take.
-pub(crate) fn repack(
-    src: &[u8],
+/// Validate an shm buffer's slice bounds and return its tightly packed row
+/// length in bytes.
+fn validate_shm_layout(
+    src_len: usize,
     offset: usize,
     stride: usize,
     width: usize,
     height: usize,
     bpp: usize,
-) -> Result<std::borrow::Cow<'_, [u8]>, Error> {
+) -> Result<usize, Error> {
     if width == 0 || height == 0 || bpp == 0 {
         return Err(Error::Unsupported("a zero-sized shm buffer".to_owned()));
     }
@@ -103,13 +99,28 @@ pub(crate) fn repack(
         .and_then(|v| v.checked_add(packed))
         .and_then(|v| offset.checked_add(v))
         .ok_or_else(|| Error::Unsupported("shm buffer dimensions overflow".to_owned()))?;
-    if src.len() < needed {
+    if src_len < needed {
         return Err(Error::Unsupported(format!(
-            "shm buffer is {} bytes; {width}x{height} at stride {stride} needs {needed}",
-            src.len()
+            "shm buffer is {src_len} bytes; {width}x{height} at stride {stride} needs {needed}"
         )));
     }
+    Ok(packed)
+}
 
+/// Repack `src` into tightly packed rows.
+///
+/// A client's shm buffer has whatever stride it chose — often padded for
+/// alignment — while tightly packed buffers use `width * bpp` per row.
+#[cfg(test)]
+pub(crate) fn repack(
+    src: &[u8],
+    offset: usize,
+    stride: usize,
+    width: usize,
+    height: usize,
+    bpp: usize,
+) -> Result<std::borrow::Cow<'_, [u8]>, Error> {
+    let packed = validate_shm_layout(src.len(), offset, stride, width, height, bpp)?;
     let total = packed
         .checked_mul(height)
         .ok_or_else(|| Error::Unsupported("shm buffer dimensions overflow".to_owned()))?;
@@ -132,9 +143,15 @@ impl ImportMemWl for VulkanRenderer {
         surface: Option<&SurfaceData>,
         damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
-        // The closure returns a Result so a bad buffer is reported rather than
-        // panicking inside someone else's callback.
-        let imported = with_buffer_contents(buffer, |pointer, len, data| {
+        let id = buffer.id();
+        // Smithay's damage is relative to one surface's previous commit. A
+        // renderer-wide cache also contains buffers from every other surface,
+        // so only buffers belonging to this surface missed that damage.
+        let surface_id = surface.map(|surface| std::ptr::from_ref(surface).addr());
+
+        // Upload directly from the locked shm mapping into the reusable staging
+        // buffer, packing only damaged rows and avoiding a full-frame heap copy.
+        with_buffer_contents(buffer, |pointer, len, data| {
             let fourcc =
                 smithay::wayland::shm::shm_format_to_fourcc(data.format).ok_or_else(|| {
                     Error::Unsupported(format!("no fourcc for shm format {:?}", data.format))
@@ -148,79 +165,77 @@ impl ImportMemWl for VulkanRenderer {
                 ));
             }
             let (width, height) = (data.width as usize, data.height as usize);
+            let offset = data.offset as usize;
+            let stride = data.stride as usize;
 
             // SAFETY: with_buffer_contents guarantees the mapping is valid and
             // the pool is locked for the duration of this closure.
             let bytes = unsafe { std::slice::from_raw_parts(pointer, len) };
-            let packed = repack(
-                bytes,
-                data.offset as usize,
-                data.stride as usize,
-                width,
-                height,
-                bpp,
-            )?;
+            validate_shm_layout(bytes.len(), offset, stride, width, height, bpp)?;
 
-            Ok((fourcc, width as i32, height as i32, packed.into_owned()))
-        })
-        .map_err(|e| Error::Unsupported(format!("not an shm buffer: {e}")))??;
-
-        let (fourcc, width, height, pixels) = imported;
-        let id = buffer.id();
-        // Smithay's damage is relative to one surface's previous commit. A
-        // renderer-wide cache also contains buffers from every other surface,
-        // so only buffers belonging to this surface missed that damage.
-        let surface_id = surface.map(|surface| std::ptr::from_ref(surface).addr());
-
-        // An existing texture of the same shape is updated in place. Creating
-        // a new image per commit would mean an allocation and a full upload
-        // every frame for every shm surface, which is the whole cost of the
-        // shm path doubled.
-        // Every other cached buffer belonging to this surface has now missed
-        // this commit. Surfaceless imports (`surface_id == None`) do not share
-        // a commit history with each other.
-        if surface_id.is_some() {
-            for entry in self
-                .shm
-                .iter_mut()
-                .filter(|e| e.surface_id == surface_id && e.id != id)
-            {
-                if entry.pending.len() < MAX_PENDING {
-                    entry.pending.extend_from_slice(damage);
+            // Every other cached buffer belonging to this surface has now
+            // missed this commit. Surfaceless imports (`surface_id == None`) do
+            // not share a commit history with each other.
+            if surface_id.is_some() {
+                for entry in self
+                    .shm
+                    .iter_mut()
+                    .filter(|e| e.surface_id == surface_id && e.id != id)
+                {
+                    if entry.pending.len() < MAX_PENDING {
+                        entry.pending.extend_from_slice(damage);
+                    }
                 }
             }
-        }
 
-        let found = self.shm.iter().position(|e| {
-            e.id == id
-                && e.surface_id == surface_id
-                && e.texture.width() as i32 == width
-                && e.texture.height() as i32 == height
-                && e.texture.image().fourcc() == fourcc
-        });
+            let found = self.shm.iter().position(|e| {
+                e.id == id
+                    && e.surface_id == surface_id
+                    && e.texture.width() as usize == width
+                    && e.texture.height() as usize == height
+                    && e.texture.image().fourcc() == fourcc
+            });
 
-        if let Some(index) = found {
-            let texture = self.shm[index].texture.clone();
-            let whole = Rectangle::from_size((width, height).into());
-            let regions = plan_upload(damage, &self.shm[index].pending, whole);
-            for region in regions {
-                self.update_memory(&texture, &pixels, region)?;
+            let whole = Rectangle::from_size((width as i32, height as i32).into());
+            if let Some(index) = found {
+                let texture = self.shm[index].texture.clone();
+                let regions = plan_upload(damage, &self.shm[index].pending, whole);
+                if !regions.is_empty() {
+                    self.upload_regions(
+                        &texture,
+                        bytes,
+                        offset,
+                        stride,
+                        &regions,
+                        ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    )?;
+                }
+                self.shm[index].pending.clear();
+                return Ok(described(texture, surface, self.sdr));
             }
-            self.shm[index].pending.clear();
-            return Ok(described(texture, surface, self.sdr));
-        }
 
-        // New, or a different shape: a full upload either way.
-        let texture = self.import_memory(&pixels, fourcc, (width, height).into(), false)?;
-        self.shm
-            .retain(|e| e.id != id || e.surface_id != surface_id);
-        self.shm.push(ShmEntry {
-            id,
-            surface_id,
-            texture: texture.clone(),
-            pending: Vec::new(),
-        });
-        Ok(described(texture, surface, self.sdr))
+            // New, or a different shape: a full upload either way.
+            let texture =
+                self.allocate_upload_texture(width as u32, height as u32, fourcc, false)?;
+            self.upload_regions(
+                &texture,
+                bytes,
+                offset,
+                stride,
+                &[whole],
+                ash::vk::ImageLayout::UNDEFINED,
+            )?;
+            self.shm
+                .retain(|e| e.id != id || e.surface_id != surface_id);
+            self.shm.push(ShmEntry {
+                id,
+                surface_id,
+                texture: texture.clone(),
+                pending: Vec::new(),
+            });
+            Ok(described(texture, surface, self.sdr))
+        })
+        .map_err(|e| Error::Unsupported(format!("not an shm buffer: {e}")))?
     }
 }
 

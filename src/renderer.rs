@@ -244,6 +244,19 @@ pub struct VulkanRenderer {
     /// declared no image description. See [`crate::color::SdrEotf`]. Read by
     /// the `wl_buffer` imports, which live in their own module.
     pub(crate) sdr: crate::color::SdrEotf,
+
+    /// Reusable growable staging buffer for SHM / CPU-memory uploads.
+    ///
+    /// Declared after `commands` so `Commands::drop` waits for all in-flight
+    /// submissions before this buffer is destroyed.
+    upload_staging: Option<crate::staging::Staging>,
+
+    #[cfg(test)]
+    upload_staging_allocs: usize,
+
+    /// Reusable scissor rectangle scratch storage borrowed by [`VulkanFrame`]
+    /// during recording so draw calls do not heap-allocate per draw.
+    scratch_scissors: Vec<Rectangle<i32, Physical>>,
 }
 
 impl std::fmt::Debug for VulkanRenderer {
@@ -272,6 +285,10 @@ impl VulkanRenderer {
             color_lut: None,
             color_lut_token: None,
             sdr: crate::color::SdrEotf::default(),
+            upload_staging: None,
+            #[cfg(test)]
+            upload_staging_allocs: 0,
+            scratch_scissors: Vec::new(),
         })
     }
 
@@ -298,8 +315,8 @@ impl VulkanRenderer {
             return Ok(());
         }
         if self.color_lut.is_some() {
-            // An earlier frame may still be sampling the old cube.
-            let _ = self.commands.wait(std::time::Duration::from_secs(5));
+            // Any in-flight frame in the ring may still be sampling the old cube.
+            let _ = self.commands.wait_all(std::time::Duration::from_secs(5));
         }
         match cube {
             Some((_, data)) => {
@@ -360,6 +377,12 @@ impl VulkanRenderer {
         &self.device
     }
 
+    /// Whether either DMA-BUF cache holds an entry whose buffer is gone.
+    fn has_dead_cache_entries(&self) -> bool {
+        self.imported.iter().any(|(weak, ..)| weak.is_gone())
+            || self.targets.iter().any(|(weak, _)| weak.is_gone())
+    }
+
     /// Drop cache entries whose buffer is gone.
     fn reap(&mut self) {
         self.imported.retain(|(weak, ..)| !weak.is_gone());
@@ -383,11 +406,12 @@ impl VulkanRenderer {
         // compositor is not itself holding, and a `VkImage` destroyed while a
         // submission still reads it is a use-after-free. `Image`'s drop has a
         // `device_wait_idle` backstop for exactly this, but it runs per image;
-        // waiting once here is the same guarantee for one fence wait, and it
-        // also retires the semaphores that submission was holding.
-        self.commands.wait(std::time::Duration::from_secs(5))?;
+        // waiting once here across all ring slots is the same guarantee for one
+        // fence wait, and it also retires the semaphores those submissions held.
+        self.commands.wait_all(std::time::Duration::from_secs(5))?;
         self.imported.clear();
         self.targets.clear();
+        self.upload_staging = None;
         // Shm textures are this renderer's own images, uploaded from the
         // client's pool. They are as stale as the imports are, and the pool
         // they came from is still mapped, so the next commit uploads it again.
@@ -489,7 +513,11 @@ impl Renderer for VulkanRenderer {
     }
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
-        self.reap();
+        if self.has_dead_cache_entries() {
+            // Drain in-flight ring slots once before dropping dead `Arc<Image>`s.
+            self.commands.wait_all(std::time::Duration::from_secs(5))?;
+            self.reap();
+        }
         Ok(())
     }
 
@@ -548,7 +576,6 @@ impl VulkanRenderer {
     ) -> Result<VulkanTexture, Error> {
         use smithay::backend::allocator::Buffer as _;
         let representation = representation.filter(|_| crate::format::is_yuv(dmabuf.format().code));
-        self.reap();
         if let Some((_, _, texture)) = self.imported.iter().find(|(weak, rep, _)| {
             weak.upgrade().as_ref() == Some(dmabuf) && *rep == representation
         }) {
@@ -557,6 +584,9 @@ impl VulkanRenderer {
             // same; re-importing would allocate a second one over the same fd.
             return Ok(texture.clone());
         }
+        // Reap dead entries on cache miss so the cache stays bounded without
+        // scanning or dropping images on the hot cache-hit path.
+        self.reap();
 
         let image = Image::import_with(&self.device, dmabuf, Purpose::Sample, representation)?;
         self.acquire_now(&image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
@@ -587,15 +617,7 @@ impl ImportMem for VulkanRenderer {
             return Err(Error::Unsupported("a zero-sized memory import".to_owned()));
         }
 
-        let image = Image::allocate(&self.device, width, height, format)?;
-        let texture = VulkanTexture {
-            image: std::sync::Arc::new(image),
-            flipped,
-            uploadable: true,
-            description: crate::color::Description::default(),
-            tonemap: crate::color::TonemapMode::default(),
-        };
-
+        let texture = self.allocate_upload_texture(width, height, format, flipped)?;
         let whole = Rectangle::from_size(size);
         self.upload(&texture, data, whole, vk::ImageLayout::UNDEFINED)?;
         Ok(texture)
@@ -639,12 +661,82 @@ impl ImportMem for VulkanRenderer {
     }
 }
 
+/// Align `offset` up to `align` (a power of two), checking for overflow.
+fn align_up(offset: usize, align: usize) -> Option<usize> {
+    let mask = align.checked_sub(1)?;
+    offset.checked_add(mask).map(|v| v & !mask)
+}
+
+/// Whether two positive-extent copy regions overlap in destination image space.
+fn copies_overlap(a: &vk::BufferImageCopy, b: &vk::BufferImageCopy) -> bool {
+    let ax0 = i64::from(a.image_offset.x);
+    let ay0 = i64::from(a.image_offset.y);
+    let ax1 = ax0 + i64::from(a.image_extent.width);
+    let ay1 = ay0 + i64::from(a.image_extent.height);
+
+    let bx0 = i64::from(b.image_offset.x);
+    let by0 = i64::from(b.image_offset.y);
+    let bx1 = bx0 + i64::from(b.image_extent.width);
+    let by1 = by0 + i64::from(b.image_extent.height);
+
+    ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+}
+
 impl VulkanRenderer {
+    pub(crate) fn allocate_upload_texture(
+        &self,
+        width: u32,
+        height: u32,
+        format: Fourcc,
+        flipped: bool,
+    ) -> Result<VulkanTexture, Error> {
+        let image = Image::allocate(&self.device, width, height, format)?;
+        Ok(VulkanTexture {
+            image: std::sync::Arc::new(image),
+            flipped,
+            uploadable: true,
+            description: crate::color::Description::default(),
+            tonemap: crate::color::TonemapMode::default(),
+        })
+    }
+
+    /// Return the reusable scratch staging buffer, allocating or growing it so
+    /// it can hold at least `needed` bytes.
+    fn ensure_upload_staging(
+        &mut self,
+        needed: vk::DeviceSize,
+    ) -> Result<&mut crate::staging::Staging, Error> {
+        let needs_alloc = match self.upload_staging.as_ref() {
+            Some(staging) => staging.size() < needed,
+            None => true,
+        };
+        if needs_alloc {
+            let capacity = match self.upload_staging.as_ref() {
+                Some(old) => needed.max(old.size().saturating_mul(2)),
+                None => needed,
+            };
+            // Drop the previous buffer before allocating its replacement so
+            // peak host-visible memory does not double during growth.
+            self.upload_staging = None;
+            let mut staging = crate::staging::Staging::new(&self.device, capacity)?;
+            staging.set_wait_on_drop(false);
+            self.upload_staging = Some(staging);
+            #[cfg(test)]
+            {
+                self.upload_staging_allocs += 1;
+            }
+        }
+        Ok(self
+            .upload_staging
+            .as_mut()
+            .expect("upload staging buffer allocated above"))
+    }
+
     /// Copy CPU pixels into an image this renderer owns.
     ///
-    /// Waits for the copy before returning. The staging buffer is freed here,
-    /// so the alternative is keeping it alive until a fence signals — worth
-    /// doing when shm turns out to be hot, and not before.
+    /// Packs only the dirty `region` rows into the reusable scratch staging
+    /// buffer starting at offset 0, submits, and waits on that slot's fence
+    /// before returning so the scratch buffer is immediately reusable.
     fn upload(
         &mut self,
         texture: &VulkanTexture,
@@ -659,36 +751,51 @@ impl VulkanRenderer {
                 image.fourcc()
             ))
         })?;
-        if region.loc.x < 0 || region.loc.y < 0 {
-            return Err(Error::Unsupported(format!(
-                "region {region:?} has a negative origin"
-            )));
-        }
-        let (x, y) = (region.loc.x, region.loc.y);
-        let (w, h) = (region.size.w.max(0) as u32, region.size.h.max(0) as u32);
-        if w == 0 || h == 0 {
-            return Err(Error::Unsupported("an empty upload region".to_owned()));
-        }
-        let end_x = (x as u32)
-            .checked_add(w)
-            .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
-        let end_y = (y as u32)
-            .checked_add(h)
-            .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
-        if end_x > image.width() || end_y > image.height() {
-            return Err(Error::Unsupported(format!(
-                "region {region:?} is outside the {}x{} texture",
-                image.width(),
-                image.height()
-            )));
-        }
-
         let stride = (image.width() as usize)
             .checked_mul(bpp)
             .ok_or_else(|| Error::Unsupported("texture stride overflows".to_owned()))?;
-        let needed = stride
+        self.upload_regions(texture, data, 0, stride, &[region], from_layout)
+    }
+
+    /// Upload one or more regions from a strided CPU buffer (`data` starting at
+    /// `src_base_offset` with `stride` bytes per row) into `texture` using the
+    /// reusable scratch staging buffer.
+    pub(crate) fn upload_regions(
+        &mut self,
+        texture: &VulkanTexture,
+        data: &[u8],
+        src_base_offset: usize,
+        stride: usize,
+        regions: &[Rectangle<i32, BufferCoord>],
+        from_layout: vk::ImageLayout,
+    ) -> Result<(), Error> {
+        let image = &texture.image;
+        let bpp = format::bytes_per_pixel(image.fourcc()).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{:?} does not have a linear per-pixel upload layout",
+                image.fourcc()
+            ))
+        })?;
+        let packed_row = (image.width() as usize)
+            .checked_mul(bpp)
+            .ok_or_else(|| Error::Unsupported("texture stride overflows".to_owned()))?;
+        if stride < packed_row {
+            return Err(Error::Unsupported(format!(
+                "upload stride {stride} is narrower than a {packed_row}-byte row"
+            )));
+        }
+        let full_packed_bytes = packed_row
             .checked_mul(image.height() as usize)
             .ok_or_else(|| Error::Unsupported("texture size overflows".to_owned()))?;
+        let needed = if image.height() == 0 {
+            src_base_offset
+        } else {
+            stride
+                .checked_mul(image.height() as usize - 1)
+                .and_then(|rows| rows.checked_add(packed_row))
+                .and_then(|total| src_base_offset.checked_add(total))
+                .ok_or_else(|| Error::Unsupported("texture size overflows".to_owned()))?
+        };
         if data.len() < needed {
             // The trait says too small is an error and beyond is truncated.
             return Err(Error::Unsupported(format!(
@@ -698,23 +805,142 @@ impl VulkanRenderer {
                 image.height()
             )));
         }
-        let buffer_offset = (y as usize)
-            .checked_mul(stride)
-            .and_then(|row| {
-                (x as usize)
-                    .checked_mul(bpp)
-                    .and_then(|col| row.checked_add(col))
-            })
-            .ok_or_else(|| Error::Unsupported("upload buffer offset overflows".to_owned()))?;
+        if regions.is_empty() {
+            return Ok(());
+        }
 
-        // The whole buffer is staged even for a partial update, so the copy
-        // can use the source stride directly instead of packing rows.
-        let mut staging = crate::staging::Staging::new(&self.device, needed as vk::DeviceSize)?;
-        staging.write(0, &data[..needed])?;
+        // Validate every region and compute its packed staging placement.
+        // Vulkan requires `bufferOffset` to be a multiple of the texel block
+        // size and 4; all supported single-plane formats have power-of-two bpp.
+        let align = bpp.max(4);
+        let mut plan: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(regions.len());
+        let mut copies: Vec<vk::BufferImageCopy> = Vec::with_capacity(regions.len());
+        let mut staged_total: usize = 0;
+
+        for &region in regions {
+            if region.loc.x < 0 || region.loc.y < 0 {
+                return Err(Error::Unsupported(format!(
+                    "region {region:?} has a negative origin"
+                )));
+            }
+            let (x, y) = (region.loc.x, region.loc.y);
+            let (w, h) = (region.size.w.max(0) as u32, region.size.h.max(0) as u32);
+            if w == 0 || h == 0 {
+                return Err(Error::Unsupported("an empty upload region".to_owned()));
+            }
+            let end_x = (x as u32)
+                .checked_add(w)
+                .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
+            let end_y = (y as u32)
+                .checked_add(h)
+                .ok_or_else(|| Error::Unsupported(format!("region {region:?} overflows")))?;
+            if end_x > image.width() || end_y > image.height() {
+                return Err(Error::Unsupported(format!(
+                    "region {region:?} is outside the {}x{} texture",
+                    image.width(),
+                    image.height()
+                )));
+            }
+
+            let row_bytes = (w as usize)
+                .checked_mul(bpp)
+                .ok_or_else(|| Error::Unsupported("upload row size overflows".to_owned()))?;
+            let region_bytes = row_bytes
+                .checked_mul(h as usize)
+                .ok_or_else(|| Error::Unsupported("upload region size overflows".to_owned()))?;
+            let src_offset = (y as usize)
+                .checked_mul(stride)
+                .and_then(|row| {
+                    (x as usize)
+                        .checked_mul(bpp)
+                        .and_then(|col| row.checked_add(col))
+                })
+                .and_then(|off| src_base_offset.checked_add(off))
+                .ok_or_else(|| Error::Unsupported("upload buffer offset overflows".to_owned()))?;
+            let dst_offset = align_up(staged_total, align)
+                .ok_or_else(|| Error::Unsupported("staging buffer offset overflows".to_owned()))?;
+            staged_total = dst_offset
+                .checked_add(region_bytes)
+                .ok_or_else(|| Error::Unsupported("staging buffer size overflows".to_owned()))?;
+
+            plan.push((dst_offset, src_offset, row_bytes, h as usize));
+            copies.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(dst_offset as vk::DeviceSize)
+                    // Zero means tightly packed to this region's image_extent.
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x, y, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    }),
+            );
+        }
+
+        // When multiple damaged regions together exceed a full frame, a single
+        // whole-image upload uses less staging memory and avoids overlaps.
+        if copies.len() > 1 && staged_total >= full_packed_bytes {
+            plan.clear();
+            copies.clear();
+            plan.push((0, src_base_offset, packed_row, image.height() as usize));
+            copies.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width: image.width(),
+                        height: image.height(),
+                        depth: 1,
+                    }),
+            );
+            staged_total = full_packed_bytes;
+        }
+
+        let staging = self.ensure_upload_staging(staged_total as vk::DeviceSize)?;
+        for (dst_offset, src_offset, row_bytes, height) in plan {
+            staging.write_rows_at(dst_offset, data, src_offset, stride, row_bytes, height)?;
+        }
+        let staging_handle = staging.handle();
+
+        // Check if any destination regions overlap: Vulkan forbids overlapping
+        // destination regions within a single `vkCmdCopyBufferToImage`.
+        let mut has_overlap = false;
+        'outer: for i in 0..copies.len() {
+            for j in (i + 1)..copies.len() {
+                if copies_overlap(&copies[i], &copies[j]) {
+                    has_overlap = true;
+                    break 'outer;
+                }
+            }
+        }
 
         let buffer = self.commands.begin()?;
         let handle = self.device.handle();
 
+        // When updating an existing texture that a still-in-flight frame slot
+        // may be sampling, wait for prior fragment/transfer stages before
+        // transitioning to TRANSFER_DST_OPTIMAL.
+        let src_stage = if from_layout == vk::ImageLayout::UNDEFINED {
+            vk::PipelineStageFlags::TOP_OF_PIPE
+        } else {
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::TRANSFER
+        };
         let to_transfer = image.transition(
             from_layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -728,43 +954,49 @@ impl VulkanRenderer {
             vk::AccessFlags::SHADER_READ,
         );
 
-        let copy = vk::BufferImageCopy::default()
-            // Where the region starts within the staged buffer.
-            .buffer_offset(buffer_offset as vk::DeviceSize)
-            // In pixels, not bytes: this is how a partial update reads the
-            // right rows out of a full-size source.
-            .buffer_row_length(image.width())
-            .buffer_image_height(image.height())
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(vk::Offset3D { x, y, z: 0 })
-            .image_extent(vk::Extent3D {
-                width: w,
-                height: h,
-                depth: 1,
-            });
-
         unsafe {
             handle.cmd_pipeline_barrier(
                 buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                src_stage,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
                 &[to_transfer],
             );
-            handle.cmd_copy_buffer_to_image(
-                buffer,
-                staging.handle(),
-                image.handle(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
-            );
+            if !has_overlap {
+                handle.cmd_copy_buffer_to_image(
+                    buffer,
+                    staging_handle,
+                    image.handle(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copies,
+                );
+            } else {
+                let write_order = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                for (i, copy) in copies.iter().enumerate() {
+                    if i > 0 {
+                        handle.cmd_pipeline_barrier(
+                            buffer,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[write_order],
+                            &[],
+                            &[],
+                        );
+                    }
+                    handle.cmd_copy_buffer_to_image(
+                        buffer,
+                        staging_handle,
+                        image.handle(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        std::slice::from_ref(copy),
+                    );
+                }
+            }
             handle.cmd_pipeline_barrier(
                 buffer,
                 vk::PipelineStageFlags::TRANSFER,
@@ -776,9 +1008,22 @@ impl VulkanRenderer {
             );
         }
 
+        if let Some(staging) = self.upload_staging.as_mut() {
+            staging.set_wait_on_drop(true);
+        }
         self.commands.submit_unsignaled()?;
         self.commands.wait(std::time::Duration::from_secs(5))?;
+        if let Some(staging) = self.upload_staging.as_mut() {
+            staging.set_wait_on_drop(false);
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn upload_staging_info(&self) -> Option<(vk::Buffer, vk::DeviceSize)> {
+        self.upload_staging
+            .as_ref()
+            .map(|staging| (staging.handle(), staging.size()))
     }
 }
 
@@ -935,7 +1180,7 @@ impl VulkanRenderer {
             .checked_mul(h as usize)
             .and_then(|pixels| pixels.checked_mul(bpp))
             .ok_or_else(|| Error::Unsupported("copy region size overflows".to_owned()))?;
-        let buffer = crate::staging::Staging::new(&self.device, len as vk::DeviceSize)?;
+        let mut buffer = crate::staging::Staging::new(&self.device, len as vk::DeviceSize)?;
 
         let command = self.commands.begin()?;
         let handle = self.device.handle();
@@ -997,7 +1242,9 @@ impl VulkanRenderer {
         unsafe {
             handle.cmd_pipeline_barrier(
                 command,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1024,6 +1271,9 @@ impl VulkanRenderer {
 
         self.commands.submit_unsignaled()?;
         self.commands.wait(std::time::Duration::from_secs(5))?;
+        // The transfer fence already signalled; dropping this mapping does not
+        // need a full device_wait_idle() that would stall unrelated frames.
+        buffer.set_wait_on_drop(false);
 
         Ok(VulkanMapping {
             buffer,
@@ -1037,8 +1287,6 @@ impl VulkanRenderer {
 
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        self.reap();
-
         let image = match self
             .targets
             .iter()
@@ -1046,6 +1294,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
         {
             Some((_, image)) => image.clone(),
             None => {
+                self.reap();
                 let image =
                     std::sync::Arc::new(Image::import(&self.device, target, Purpose::Render)?);
                 self.targets.push((target.weak(), image.clone()));
@@ -1231,7 +1480,7 @@ impl smithay::backend::renderer::Blit for VulkanRenderer {
         unsafe {
             handle.cmd_pipeline_barrier(
                 command,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1362,6 +1611,9 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// The output transform this frame was begun with. Every position map is
     /// built through it, so a rotated display needs nothing else.
     transform: Transform,
+    /// Scratch scissor list borrowed from `renderer.scratch_scissors` and
+    /// returned on drop so draw calls do not heap-allocate per draw.
+    scissors: Vec<Rectangle<i32, Physical>>,
     finished: bool,
 }
 
@@ -1385,17 +1637,17 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 "output size must be positive, got {output_size:?}"
             )));
         }
-        let target = framebuffer.image.clone();
+        let target = &framebuffer.image;
         let buffer = renderer.commands.begin()?;
-        let device = renderer.device.clone();
-        let handle = device.handle();
+        let handle = renderer.device.handle();
 
-        // The target may still be owned by whoever allocated it.
+        // The target may still be owned by whoever allocated it, or written by
+        // an earlier pipelined slot on this queue.
         let acquire = target.acquire_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         unsafe {
             handle.cmd_pipeline_barrier(
                 buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1426,7 +1678,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .color_attachments(&attachments);
 
         unsafe {
-            device
+            renderer
+                .device
                 .dynamic_rendering()
                 .cmd_begin_rendering(buffer, &rendering);
             handle.cmd_set_viewport(
@@ -1444,12 +1697,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             handle.cmd_set_scissor(buffer, 0, &[area]);
         }
 
+        let scissors = std::mem::take(&mut renderer.scratch_scissors);
         Ok(Self {
             renderer,
             framebuffer,
             output_size,
             logical_size: transform.transform_size(output_size),
             transform,
+            scissors,
             finished: false,
         })
     }
@@ -1458,12 +1713,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         self.renderer.commands.buffer()
     }
 
-    /// Restrict drawing to `damage`, in target pixels.
-    ///
-    /// Smithay passes damage per draw call rather than per frame, so scissor
-    /// is set immediately before each draw and covers the whole target again
-    /// afterwards.
-    /// Scissor a draw to its damage.
+    /// Populate `self.scissors` with framebuffer-space scissor rectangles for
+    /// `damage` within `dst`, reusing its allocation across draw calls.
     ///
     /// The damage rectangles handed to `draw_solid` and
     /// `render_texture_from_to` are relative to `dst`, not to the
@@ -1475,11 +1726,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// so on the second monitor it is drawn at minus that monitor's position
     /// and every damage rectangle lands a screen's width outside the
     /// framebuffer. Nothing is drawn and the output shows the clear colour.
-    fn scissors_within(
-        &self,
+    fn fill_scissors_within(
+        &mut self,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
-    ) -> Vec<Rectangle<i32, Physical>> {
+    ) {
         // No damage means nothing to draw, which is how Smithay's own renderer
         // reads it (`gles/mod.rs:2452`). Treating it as "the whole
         // destination" instead is not the safe direction it looks: the clear
@@ -1487,32 +1738,22 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // output every frame. With a nearly fullscreen opaque window there is
         // frequently nothing to clear, so the desktop is erased and only what
         // was damaged that frame is drawn back.
-        let clipped: Vec<Rectangle<i32, Physical>> = damage
-            .iter()
-            .filter_map(|rect| translate_and_clip_rect(*rect, dst.loc, dst))
-            .collect();
-
-        // Still desktop space at this point. The scissor is in framebuffer
-        // coordinates, and the two differ whenever the transform swaps axes —
-        // scissoring a rotated output with its own rectangle leaves most of
-        // the framebuffer untouched. Intersect with the framebuffer bounds so a
-        // negative-origin damage rectangle is clipped instead of shifted
-        // on-screen when `vk::Rect2D` clamps negative offsets to zero.
+        self.scissors.clear();
         let target = &self.framebuffer.image;
         let bounds = Rectangle::from_size(Size::from((
             target.width().min(i32::MAX as u32) as i32,
             target.height().min(i32::MAX as u32) as i32,
         )));
-        clipped
-            .into_iter()
-            .filter_map(|rect| {
-                let fb = crate::transform::framebuffer_rect(rect, self.output_size, self.transform);
-                clip_physical_rect(fb, bounds)
-            })
-            .collect()
+        let output_size = self.output_size;
+        let transform = self.transform;
+        self.scissors.extend(damage.iter().filter_map(|rect| {
+            let clipped = translate_and_clip_rect(*rect, dst.loc, dst)?;
+            let fb = crate::transform::framebuffer_rect(clipped, output_size, transform);
+            clip_physical_rect(fb, bounds)
+        }));
     }
 
-    /// Set the one scissor the pipeline has.
+    /// Set the one scissor the pipeline has (`None` resets to the full target).
     ///
     /// `scissor_count` is 1, so `cmd_set_scissor` with an array sets registers
     /// the pipeline never reads: everything after the first rectangle is
@@ -1520,37 +1761,34 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// drawn. Damage arrives as several rectangles the moment a window sits in
     /// front of something — the region around it is a frame, not a box — so
     /// the caller draws once per rectangle instead.
-    fn set_scissor(&self, rects: &[Rectangle<i32, Physical>]) {
-        debug_assert!(rects.len() <= 1, "the pipeline has one scissor");
-        let target = &self.framebuffer.image;
-        let scissors: Vec<vk::Rect2D> = if rects.is_empty() {
-            vec![vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: target.width(),
-                    height: target.height(),
-                },
-            }]
-        } else {
-            rects
-                .iter()
-                .map(|r| vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: r.loc.x.max(0),
-                        y: r.loc.y.max(0),
-                    },
+    fn set_scissor(&self, rect: Option<Rectangle<i32, Physical>>) {
+        let scissor = match rect {
+            None => {
+                let target = &self.framebuffer.image;
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
                     extent: vk::Extent2D {
-                        width: r.size.w.max(0) as u32,
-                        height: r.size.h.max(0) as u32,
+                        width: target.width(),
+                        height: target.height(),
                     },
-                })
-                .collect()
+                }
+            }
+            Some(r) => vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: r.loc.x.max(0),
+                    y: r.loc.y.max(0),
+                },
+                extent: vk::Extent2D {
+                    width: r.size.w.max(0) as u32,
+                    height: r.size.h.max(0) as u32,
+                },
+            },
         };
         unsafe {
             self.renderer
                 .device
                 .handle()
-                .cmd_set_scissor(self.command_buffer(), 0, &scissors);
+                .cmd_set_scissor(self.command_buffer(), 0, &[scissor]);
         }
     }
 
@@ -1561,8 +1799,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// background blur needs happens in the middle of one.
     fn begin_rendering(&self) {
         let target = &self.framebuffer.image;
-        let device = self.renderer.device.clone();
-        let handle = device.handle();
+        let handle = self.renderer.device.handle();
         let buffer = self.command_buffer();
 
         let attachment = vk::RenderingAttachmentInfo::default()
@@ -1583,7 +1820,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .layer_count(1)
             .color_attachments(&attachments);
         unsafe {
-            device
+            self.renderer
+                .device
                 .dynamic_rendering()
                 .cmd_begin_rendering(buffer, &rendering);
             handle.cmd_set_viewport(
@@ -1763,8 +2001,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         damage: &[Rectangle<i32, Physical>],
         alpha: f32,
     ) -> Result<(), Error> {
-        let scissors = self.scissors_within(dst, damage);
-        if scissors.is_empty() {
+        self.fill_scissors_within(dst, damage);
+        if self.scissors.is_empty() {
             return Ok(());
         }
 
@@ -1793,8 +2031,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let layout = self.renderer.pipelines.layout();
         let sampler = self.renderer.pipelines.sampler();
         let buffer = self.command_buffer();
-        let device = self.renderer.device.clone();
-        let handle = device.handle();
+        let handle = self.renderer.device.handle();
 
         let surface_info = vk::DescriptorImageInfo::default()
             .sampler(sampler)
@@ -1812,13 +2049,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 push.as_bytes(),
             );
-            for rect in &scissors {
-                self.set_scissor(std::slice::from_ref(rect));
+            for &rect in &self.scissors {
+                self.set_scissor(Some(rect));
                 handle.cmd_draw(buffer, 4, 1, 0, 0);
             }
         }
 
-        self.set_scissor(&[]);
+        self.set_scissor(None);
         Ok(())
     }
 }
@@ -1837,29 +2074,29 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         surface: Option<vk::DescriptorImageInfo>,
         lut: Option<vk::DescriptorImageInfo>,
     ) {
-        let mut infos = Vec::with_capacity(2);
-        let mut bindings = Vec::with_capacity(2);
+        let mut infos = [vk::DescriptorImageInfo::default(); 2];
+        let mut bindings = [0u32; 2];
+        let mut count = 0;
         if let Some(info) = surface {
-            infos.push(info);
-            bindings.push(0u32);
+            infos[count] = info;
+            bindings[count] = 0;
+            count += 1;
         }
         if let Some(info) = lut {
-            infos.push(info);
-            bindings.push(1u32);
+            infos[count] = info;
+            bindings[count] = 1;
+            count += 1;
         }
-        if infos.is_empty() {
+        if count == 0 {
             return;
         }
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .zip(bindings.iter())
-            .map(|(info, binding)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(info))
-            })
-            .collect();
+        let mut writes = [vk::WriteDescriptorSet::default(); 2];
+        for i in 0..count {
+            writes[i] = vk::WriteDescriptorSet::default()
+                .dst_binding(bindings[i])
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&infos[i]));
+        }
         unsafe {
             self.renderer
                 .device
@@ -1869,7 +2106,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     vk::PipelineBindPoint::GRAPHICS,
                     layout,
                     0,
-                    &writes,
+                    &writes[..count],
                 );
         }
     }
@@ -1898,13 +2135,13 @@ impl Frame for VulkanFrame<'_, '_> {
         at: &[Rectangle<i32, Physical>],
     ) -> Result<(), Self::Error> {
         // Nothing to clear. Not the same as "clear everything" — see
-        // `scissors_within`.
+        // `fill_scissors_within`.
         if at.is_empty() {
             return Ok(());
         }
         let whole = Rectangle::from_size(self.logical_size);
-        let rects = self.scissors_within(whole, at);
-        if rects.is_empty() {
+        self.fill_scissors_within(whole, at);
+        if self.scissors.is_empty() {
             return Ok(());
         }
 
@@ -1930,29 +2167,43 @@ impl Frame for VulkanFrame<'_, '_> {
                     },
                 },
             };
-            let clear_rects: Vec<vk::ClearRect> = rects
-                .iter()
-                .map(|r| vk::ClearRect {
-                    rect: vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: r.loc.x,
-                            y: r.loc.y,
-                        },
-                        extent: vk::Extent2D {
-                            width: r.size.w as u32,
-                            height: r.size.h as u32,
-                        },
+            let to_clear_rect = |r: &Rectangle<i32, Physical>| vk::ClearRect {
+                rect: vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: r.loc.x,
+                        y: r.loc.y,
                     },
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .collect();
-            unsafe {
-                self.renderer.device.handle().cmd_clear_attachments(
-                    self.command_buffer(),
-                    &[attachment],
-                    &clear_rects,
-                );
+                    extent: vk::Extent2D {
+                        width: r.size.w as u32,
+                        height: r.size.h as u32,
+                    },
+                },
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            const INLINE_CLEAR_RECTS: usize = 8;
+            if self.scissors.len() <= INLINE_CLEAR_RECTS {
+                let mut clear_rects = [vk::ClearRect::default(); INLINE_CLEAR_RECTS];
+                for (dst, r) in clear_rects.iter_mut().zip(self.scissors.iter()) {
+                    *dst = to_clear_rect(r);
+                }
+                unsafe {
+                    self.renderer.device.handle().cmd_clear_attachments(
+                        self.command_buffer(),
+                        &[attachment],
+                        &clear_rects[..self.scissors.len()],
+                    );
+                }
+            } else {
+                let clear_rects: Vec<vk::ClearRect> =
+                    self.scissors.iter().map(to_clear_rect).collect();
+                unsafe {
+                    self.renderer.device.handle().cmd_clear_attachments(
+                        self.command_buffer(),
+                        &[attachment],
+                        &clear_rects,
+                    );
+                }
             }
         }
         if use_lut {
@@ -1967,8 +2218,8 @@ impl Frame for VulkanFrame<'_, '_> {
         damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), Self::Error> {
-        let scissors = self.scissors_within(dst, damage);
-        if scissors.is_empty() {
+        self.fill_scissors_within(dst, damage);
+        if self.scissors.is_empty() {
             return Ok(());
         }
 
@@ -2019,13 +2270,13 @@ impl Frame for VulkanFrame<'_, '_> {
             // One draw per rectangle. The pipeline declares a single scissor,
             // so setting an array of them leaves everything after the first
             // silently unclipped-to — see `set_scissor`.
-            for rect in &scissors {
-                self.set_scissor(std::slice::from_ref(rect));
+            for &rect in &self.scissors {
+                self.set_scissor(Some(rect));
                 handle.cmd_draw(buffer, 4, 1, 0, 0);
             }
         }
 
-        self.set_scissor(&[]);
+        self.set_scissor(None);
         Ok(())
     }
 
@@ -2039,8 +2290,8 @@ impl Frame for VulkanFrame<'_, '_> {
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Self::Error> {
-        let scissors = self.scissors_within(dst, damage);
-        if scissors.is_empty() {
+        self.fill_scissors_within(dst, damage);
+        if self.scissors.is_empty() {
             return Ok(());
         }
 
@@ -2088,8 +2339,7 @@ impl Frame for VulkanFrame<'_, '_> {
             }
         };
         let buffer = self.command_buffer();
-        let device = self.renderer.device.clone();
-        let handle = device.handle();
+        let handle = self.renderer.device.handle();
 
         let surface_info = vk::DescriptorImageInfo::default()
             .sampler(sampler)
@@ -2107,13 +2357,13 @@ impl Frame for VulkanFrame<'_, '_> {
                 push.as_bytes(),
             );
             // One draw per rectangle, as in draw_solid.
-            for rect in &scissors {
-                self.set_scissor(std::slice::from_ref(rect));
+            for &rect in &self.scissors {
+                self.set_scissor(Some(rect));
                 handle.cmd_draw(buffer, 4, 1, 0, 0);
             }
         }
 
-        self.set_scissor(&[]);
+        self.set_scissor(None);
         Ok(())
     }
 
@@ -2141,13 +2391,15 @@ impl Frame for VulkanFrame<'_, '_> {
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
         self.finished = true;
 
-        let target = self.framebuffer.image.clone();
+        let target = &self.framebuffer.image;
         let buffer = self.command_buffer();
-        let device = self.renderer.device.clone();
-        let handle = device.handle();
+        let handle = self.renderer.device.handle();
 
         unsafe {
-            device.dynamic_rendering().cmd_end_rendering(buffer);
+            self.renderer
+                .device
+                .dynamic_rendering()
+                .cmd_end_rendering(buffer);
             let release = target.release_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
             handle.cmd_pipeline_barrier(
                 buffer,
@@ -2223,6 +2475,8 @@ impl<'a, 'frame: 'a, 'buffer> FrameContext<'a, 'frame, 'buffer, VulkanRenderer>
 
 impl Drop for VulkanFrame<'_, '_> {
     fn drop(&mut self) {
+        self.scissors.clear();
+        self.renderer.scratch_scissors = std::mem::take(&mut self.scissors);
         if self.finished {
             return;
         }
@@ -2230,12 +2484,14 @@ impl Drop for VulkanFrame<'_, '_> {
         // in COLOR_ATTACHMENT_OPTIMAL, and an unsubmitted command buffer. End
         // the pass and release the target back to GENERAL / FOREIGN_EXT so the
         // next frame or readback sees the expected layout and ownership.
-        let target = self.framebuffer.image.clone();
+        let target = &self.framebuffer.image;
         let buffer = self.renderer.commands.buffer();
-        let device = self.renderer.device.clone();
-        let handle = device.handle();
+        let handle = self.renderer.device.handle();
         unsafe {
-            device.dynamic_rendering().cmd_end_rendering(buffer);
+            self.renderer
+                .device
+                .dynamic_rendering()
+                .cmd_end_rendering(buffer);
             let release = target.release_barrier(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
             handle.cmd_pipeline_barrier(
                 buffer,
@@ -3963,6 +4219,287 @@ mod tests {
                 h.renderer.has_dmabuf_format(*format),
                 "advertised {format:?} but would not accept it"
             );
+        }
+    }
+
+    #[test]
+    fn packed_partial_region_shm_upload_preserves_surrounding_pixels() {
+        let Some(TestGpu { device, .. }) = require_gpu() else {
+            return;
+        };
+        let mut renderer = VulkanRenderer::new(&device).expect("renderer");
+
+        let (w, h) = (16usize, 12usize);
+        let bg = [10u8, 20, 30, 255];
+        let mut pixels: Vec<u8> = std::iter::repeat_n(bg, w * h).flatten().collect();
+        let texture = renderer
+            .import_memory(
+                &pixels,
+                Fourcc::Argb8888,
+                (w as i32, h as i32).into(),
+                false,
+            )
+            .expect("import_memory");
+
+        // Paint a unique per-pixel pattern across the entire CPU buffer, but
+        // only mark an interior sub-rectangle (3, 2, 7x5) as dirty. Pixels
+        // outside the dirty rect must remain `bg` on the GPU even though the
+        // CPU buffer changed outside the rect.
+        let dirty = Rectangle::new((3, 2).into(), (7, 5).into());
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                pixels[i] = (x as u8).wrapping_mul(17).wrapping_add(1);
+                pixels[i + 1] = (y as u8).wrapping_mul(23).wrapping_add(2);
+                pixels[i + 2] = ((x + y) as u8).wrapping_mul(11).wrapping_add(3);
+                pixels[i + 3] = 255;
+            }
+        }
+        renderer
+            .update_memory(&texture, &pixels, dirty)
+            .expect("partial update_memory");
+
+        let mapping = renderer
+            .copy_texture(
+                &texture,
+                Rectangle::from_size((w as i32, h as i32).into()),
+                Fourcc::Argb8888,
+            )
+            .expect("copy_texture");
+        let got = renderer.map_texture(&mapping).expect("map_texture");
+        assert_eq!(got.len(), w * h * 4);
+
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let actual = [got[i], got[i + 1], got[i + 2], got[i + 3]];
+                let inside = (x as i32) >= dirty.loc.x
+                    && (x as i32) < dirty.loc.x + dirty.size.w
+                    && (y as i32) >= dirty.loc.y
+                    && (y as i32) < dirty.loc.y + dirty.size.h;
+                let expected = if inside {
+                    [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+                } else {
+                    bg
+                };
+                assert_eq!(actual, expected, "pixel ({x},{y}) inside={inside} mismatch");
+            }
+        }
+
+        // Preserve validation checks: short buffer, negative origin, empty, OOB.
+        assert!(renderer
+            .update_memory(&texture, &pixels[..pixels.len() - 4], dirty)
+            .is_err());
+        assert!(renderer
+            .update_memory(
+                &texture,
+                &pixels,
+                Rectangle::new((-1, 0).into(), (4, 4).into())
+            )
+            .is_err());
+        assert!(renderer
+            .update_memory(
+                &texture,
+                &pixels,
+                Rectangle::new((0, 0).into(), (0, 4).into())
+            )
+            .is_err());
+        assert!(renderer
+            .update_memory(
+                &texture,
+                &pixels,
+                Rectangle::new((12, 0).into(), (8, 4).into())
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn staging_buffer_is_reused_and_grown_across_upload_sizes() {
+        let Some(TestGpu { device, .. }) = require_gpu() else {
+            return;
+        };
+        let mut renderer = VulkanRenderer::new(&device).expect("renderer");
+        assert!(renderer.upload_staging_info().is_none());
+
+        // 1. Initial 8x8 upload allocates staging sized for 8*8*4 = 256 bytes.
+        let small: Vec<u8> = std::iter::repeat_n([1u8, 2, 3, 255], 8 * 8)
+            .flatten()
+            .collect();
+        let tex_small = renderer
+            .import_memory(&small, Fourcc::Argb8888, (8, 8).into(), false)
+            .expect("import small");
+        let (handle_1, cap_1) = renderer.upload_staging_info().expect("staging allocated");
+        assert_eq!(cap_1, (8 * 8 * 4) as vk::DeviceSize);
+        assert_eq!(renderer.upload_staging_allocs, 1);
+
+        // 2. Partial update and another same-size upload reuse the exact same buffer.
+        renderer
+            .update_memory(
+                &tex_small,
+                &small,
+                Rectangle::new((2, 2).into(), (3, 3).into()),
+            )
+            .expect("partial small");
+        assert_eq!(
+            renderer.upload_staging_info(),
+            Some((handle_1, cap_1)),
+            "smaller partial upload must reuse existing staging buffer"
+        );
+        assert_eq!(renderer.upload_staging_allocs, 1);
+
+        let _tex_small2 = renderer
+            .import_memory(&small, Fourcc::Argb8888, (8, 8).into(), false)
+            .expect("import small 2");
+        assert_eq!(
+            renderer.upload_staging_info(),
+            Some((handle_1, cap_1)),
+            "same-size upload must reuse existing staging buffer"
+        );
+        assert_eq!(renderer.upload_staging_allocs, 1);
+
+        // 3. Larger 32x32 upload grows capacity and preserves exact pixels.
+        let large: Vec<u8> = std::iter::repeat_n([40u8, 80, 120, 255], 32 * 32)
+            .flatten()
+            .collect();
+        let tex_large = renderer
+            .import_memory(&large, Fourcc::Argb8888, (32, 32).into(), false)
+            .expect("import large");
+        let (handle_2, cap_2) = renderer.upload_staging_info().expect("staging grown");
+        assert!(cap_2 >= (32 * 32 * 4) as vk::DeviceSize);
+        assert!(cap_2 > cap_1);
+        assert_eq!(renderer.upload_staging_allocs, 2);
+
+        // 4. Subsequent smaller upload reuses the grown buffer without shrinking.
+        renderer
+            .update_memory(
+                &tex_small,
+                &small,
+                Rectangle::new((0, 0).into(), (4, 4).into()),
+            )
+            .expect("update after grow");
+        assert_eq!(renderer.upload_staging_info(), Some((handle_2, cap_2)));
+        assert_eq!(renderer.upload_staging_allocs, 2);
+
+        // 5. After cache invalidation, a tiny partial update only allocates
+        // staging for the dirty rect, not the full texture!
+        renderer.invalidate_caches().expect("invalidate_caches");
+        assert!(renderer.upload_staging_info().is_none());
+
+        let dirty = Rectangle::new((5, 6).into(), (4, 3).into());
+        let mut large_updated = large.clone();
+        for y in 6..9 {
+            for x in 5..9 {
+                let i = (y * 32 + x) * 4;
+                large_updated[i..i + 4].copy_from_slice(&[200, 150, 100, 255]);
+            }
+        }
+        renderer
+            .update_memory(&tex_large, &large_updated, dirty)
+            .expect("partial after invalidate");
+        let (_, cap_partial) = renderer
+            .upload_staging_info()
+            .expect("partial staging allocated");
+        assert_eq!(
+            cap_partial,
+            (4 * 3 * 4) as vk::DeviceSize,
+            "partial update must stage only dirty rect bytes, not the full 32x32 image"
+        );
+        assert_eq!(renderer.upload_staging_allocs, 3);
+
+        let mapping = renderer
+            .copy_texture(
+                &tex_large,
+                Rectangle::from_size((32, 32).into()),
+                Fourcc::Argb8888,
+            )
+            .expect("copy_texture");
+        let got = renderer.map_texture(&mapping).expect("map_texture");
+        let at = |x: usize, y: usize| {
+            let i = (y * 32 + x) * 4;
+            [got[i], got[i + 1], got[i + 2], got[i + 3]]
+        };
+        assert_eq!(at(6, 7), [200, 150, 100, 255], "inside dirty rect");
+        assert_eq!(at(0, 0), [40, 80, 120, 255], "outside dirty rect");
+    }
+
+    #[test]
+    fn upload_regions_batches_disjoint_and_overlapping_rects() {
+        let Some(TestGpu { device, .. }) = require_gpu() else {
+            return;
+        };
+        let mut renderer = VulkanRenderer::new(&device).expect("renderer");
+
+        let (w, h) = (12usize, 10usize);
+        let bg = [5u8, 6, 7, 255];
+        let base: Vec<u8> = std::iter::repeat_n(bg, w * h).flatten().collect();
+        let texture = renderer
+            .import_memory(&base, Fourcc::Argb8888, (w as i32, h as i32).into(), false)
+            .expect("import");
+
+        // Build a padded-stride buffer with non-zero base offset (8 bytes).
+        let base_offset = 8usize;
+        let stride = w * 4 + 12;
+        let mut strided = vec![0xEEu8; base_offset + stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = base_offset + y * stride + x * 4;
+                strided[i..i + 4].copy_from_slice(&[(x * 20) as u8, (y * 25) as u8, 99, 255]);
+            }
+        }
+
+        // Disjoint regions uploaded in one batched call.
+        let r1 = Rectangle::new((1, 1).into(), (3, 2).into());
+        let r2 = Rectangle::new((7, 5).into(), (4, 3).into());
+        renderer
+            .upload_regions(
+                &texture,
+                &strided,
+                base_offset,
+                stride,
+                &[r1, r2],
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            )
+            .expect("disjoint batch");
+
+        // Overlapping regions uploaded in one batched call.
+        let r3 = Rectangle::new((2, 2).into(), (4, 3).into());
+        let r4 = Rectangle::new((4, 3).into(), (4, 3).into());
+        renderer
+            .upload_regions(
+                &texture,
+                &strided,
+                base_offset,
+                stride,
+                &[r3, r4],
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            )
+            .expect("overlapping batch");
+
+        let mapping = renderer
+            .copy_texture(
+                &texture,
+                Rectangle::from_size((w as i32, h as i32).into()),
+                Fourcc::Argb8888,
+            )
+            .expect("copy");
+        let got = renderer.map_texture(&mapping).expect("map");
+        let in_rect = |x: i32, y: i32, r: Rectangle<i32, BufferCoord>| {
+            x >= r.loc.x && x < r.loc.x + r.size.w && y >= r.loc.y && y < r.loc.y + r.size.h
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let actual = [got[i], got[i + 1], got[i + 2], got[i + 3]];
+                let touched = [r1, r2, r3, r4]
+                    .iter()
+                    .any(|&r| in_rect(x as i32, y as i32, r));
+                let expected = if touched {
+                    [(x * 20) as u8, (y * 25) as u8, 99, 255]
+                } else {
+                    bg
+                };
+                assert_eq!(actual, expected, "pixel ({x},{y}) touched={touched}");
+            }
         }
     }
 }

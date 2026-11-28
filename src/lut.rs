@@ -162,7 +162,10 @@ impl ColorLut {
             }
         }
         staging.write(0, &half)?;
-        self.record(staging.handle())
+        self.record(staging.handle())?;
+        // `record` already waited for the upload fence to signal.
+        staging.set_wait_on_drop(false);
+        Ok(())
     }
 
     /// One command buffer: make the cube copyable, copy into it, and leave it
